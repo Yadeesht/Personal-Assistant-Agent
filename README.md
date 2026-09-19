@@ -148,15 +148,7 @@ models/
 
 ## 4) Run modes
 
-### A) Custom web dashboard (recommended)
-
-```powershell
-python frontend/web_server.py
-```
-
-Open the URL shown in terminal (typically `http://127.0.0.1:8080`).
-
-### B) Terminal mode (`main.py`)
+### Terminal mode (`main.py`)
 
 ```powershell
 python main.py
