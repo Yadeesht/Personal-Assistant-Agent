@@ -28,7 +28,21 @@ from utils.helper import (
 )
 from utils.memory_manager import log_event, sanitize_history
 from langgraph.types import Command
+import langchain_core.tools.base
 from langchain_core.tools import tool, InjectedToolCallId
+
+if not hasattr(langchain_core.tools.base, "TOOL_MESSAGE_BLOCK_TYPES"):
+    langchain_core.tools.base.TOOL_MESSAGE_BLOCK_TYPES = (
+        "text",
+        "image_url",
+        "image",
+        "json",
+        "search_result",
+        "custom_tool_call_output",
+        "document",
+        "file",
+    )
+
 from langgraph.prebuilt import InjectedState
 from typing import Annotated
 from langchain_core.messages import HumanMessage

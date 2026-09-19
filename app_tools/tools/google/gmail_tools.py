@@ -293,10 +293,14 @@ async def read_email(email_id: str) -> dict[str, Any]:
         if mime_message.is_multipart():
             for part in mime_message.walk():
                 if part.get_content_type() == "text/plain":
-                    body = part.get_payload(decode=True).decode()
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        body = payload.decode(errors="replace")
                     break
         else:
-            body = mime_message.get_payload(decode=True).decode()
+            payload = mime_message.get_payload(decode=True)
+            if payload:
+                body = payload.decode(errors="replace")
 
         logger.info(f"Email read: {request.email_id}")
 

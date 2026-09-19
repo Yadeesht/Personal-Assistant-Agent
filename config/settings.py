@@ -15,6 +15,10 @@ VECTOR_DB = DATA_DIR / "embeddings"
 KNOWLEDGE_GRAPH_DB = DATA_DIR / "knowledge_graph_db" / "knowledge_graph.db"
 EPISODIC_RAG_DB = DATA_DIR / "episodic_rag_db"
 
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+KNOWLEDGE_GRAPH_DB.parent.mkdir(parents=True, exist_ok=True)
+EPISODIC_RAG_DB.mkdir(parents=True, exist_ok=True)
+
 # -----------------------------------------------------------------------------
 # API keys and provider endpoints
 # -----------------------------------------------------------------------------

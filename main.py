@@ -1,11 +1,32 @@
+import os
+
+# Disable TensorFlow backend detection in Hugging Face Transformers
+# (this repository only uses PyTorch for embeddings and avoids Keras 3 conflicts)
+os.environ.setdefault("USE_TF", "0")
+os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
+os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
+
 import asyncio
 import threading
 import time
 from datetime import datetime
 
 import aiosqlite
+import langchain_core.tools.base
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.tools import StructuredTool
+
+if not hasattr(langchain_core.tools.base, "TOOL_MESSAGE_BLOCK_TYPES"):
+    langchain_core.tools.base.TOOL_MESSAGE_BLOCK_TYPES = (
+        "text",
+        "image_url",
+        "image",
+        "json",
+        "search_result",
+        "custom_tool_call_output",
+        "document",
+        "file",
+    )
 
 from app_tools.core.server_init import (
     communication_server,
@@ -105,6 +126,7 @@ async def main():
             "supervisor": supervisor_tools,
         }
 
+        CHECKPOINT_DB.parent.mkdir(parents=True, exist_ok=True)
         async with aiosqlite.connect(str(CHECKPOINT_DB)) as connection:
             checkpointer = AsyncSqliteSaver(connection)
             graph = build_graph(tool_sets, checkpointer)
