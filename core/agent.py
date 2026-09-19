@@ -145,7 +145,7 @@ def supervisor_node_factory(
                 )
                 last_messages = [summary_msg] + last_messages
 
-            final_prompt = system_prompt
+            final_prompt = system_prompt.replace("{current_time}", current_time)
 
             message = [SystemMessage(content=final_prompt)] + last_messages
             message = clean_unmatched_tool_calls(message)
@@ -291,7 +291,8 @@ def agent_node_factory(llm_with_tools, system_prompt, agent_name: str):
         logger.info("=" * 80)
 
         try:
-            messages = [SystemMessage(content=system_prompt)] + last_messages
+            final_prompt = system_prompt.replace("{current_time}", current_time)
+            messages = [SystemMessage(content=final_prompt)] + last_messages
             messages = clean_unmatched_tool_calls(messages)
             logger.info(
                 f"🤖 Sending messages to LLM with {count_tokens(messages)} tokens"
@@ -591,7 +592,28 @@ async def summerizer_node(state: State):
     except Exception as e:
         logger.error(f"Failed to log summarizer audit event: {e}")
 
-    return {"summary": summarized_content, "messages": delete_actions}
+    updates = {"summary": summarized_content, "messages": delete_actions}
+
+    # The global "messages" channel doesn't mirror every scoped-agent
+    # message 1:1 (e.g. supervisor handoff seeds only live in the scoped
+    # channel), so per-agent channels never shrink if we only prune here.
+    # Mirror the deletion into each scoped channel, but only for ids that
+    # actually exist there — add_messages raises if asked to remove an id
+    # it doesn't have.
+    ids_to_remove = {m.id for m in messages_to_summerize if getattr(m, "id", None)}
+    if ids_to_remove:
+        for message_key in AGENT_MESSAGE_KEY.values():
+            scoped_messages = state.get(message_key, [])
+            scoped_ids = {
+                m.id for m in scoped_messages if getattr(m, "id", None)
+            }
+            matched_ids = ids_to_remove & scoped_ids
+            if matched_ids:
+                updates[message_key] = [
+                    RemoveMessage(id=mid) for mid in matched_ids
+                ]
+
+    return updates
 
 
 def memory_node_factory():
@@ -608,11 +630,7 @@ def memory_node_factory():
 
         now_float = time.time()
 
-        updates = {
-            "summary": "",
-            "number_of_summaries_today": 0,
-            "last_summary_timestamp": now_float,
-        }
+        updates = {}
 
         await updation_knowledge_graph(
             state=state, thread_id=DEFAULT_THREAD_ID, db_path=MEMORY_DB
@@ -621,6 +639,8 @@ def memory_node_factory():
         await updation_episodic_rag(
             past_summary_date=state.get("last_memory_timestamp", 0.0), db_path=MEMORY_DB
         )
+
+        updates["last_knowledgegraph_timestamp"] = now_float
 
         updates["last_memory_timestamp"] = now_float
         return updates
@@ -669,7 +689,11 @@ async def updation_knowledge_graph(
 ):
     """Extract new facts from logs and apply create/update ops to knowledge graph."""
     try:
-        from rag.knowledge_graph import KnowledgeGraph
+        # Reuse the shared singleton (app_tools.tools.rag_tools) instead of
+        # opening a second kuzu.Database on the same path — kuzu does not
+        # support multiple concurrent connections to one database file from
+        # the same process.
+        from app_tools.tools.rag_tools import get_kg_instance
 
         logger.info("🔄 Starting knowledge graph update process.")
         last_update = state.get("last_knowledgegraph_timestamp", 0.0)
@@ -684,16 +708,16 @@ async def updation_knowledge_graph(
             last_update_str = str(last_update)
 
         query = """
-            SELECT actor, message 
-            FROM human_logs 
-            WHERE thread_id = ? 
-            AND actor IN (?,?,?) 
-            AND timestamp > ? 
+            SELECT actor, message
+            FROM human_logs
+            WHERE thread_id = ?
+            AND actor IN (?,?)
+            AND timestamp > ?
             AND COALESCE(json_extract(metadata, '$.type'), '') != 'tool_call'
             ORDER BY timestamp ASC;
         """
 
-        target_actors = ("human", "supervisor", "clarification_agent")
+        target_actors = ("Human_node", "supervisor")
 
         async with aiosqlite.connect(db_path) as db:
             async with db.execute(
@@ -707,7 +731,7 @@ async def updation_knowledge_graph(
             return
 
         extraction_context = "\n".join([f"{actor}: {msg}" for actor, msg in rows])
-        kg = KnowledgeGraph()
+        kg = get_kg_instance()
         candidates_json = kg.generate_entity_relation(extraction_context)
 
         logger.info(
@@ -738,7 +762,7 @@ async def updation_knowledge_graph(
                 kg.add_entity(
                     node_id=entity["id"],
                     node_type=entity.get("type", "unknown"),
-                    search_keywords=", ".join(entity.get("keywords", [])),
+                    search_keywords=", ".join(entity.get("search_keywords", [])),
                     description=entity.get("description", ""),
                 )
             elif action == "UPDATE":

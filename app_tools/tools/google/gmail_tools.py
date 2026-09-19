@@ -17,7 +17,6 @@ from app_tools.core.server_init import communication_server
 from utils.helper import clean_email_body
 
 from app_tools.helper.pydantic_models import (
-    EmailAddress,
     EmailResponse,
     SendEmailRequest,
     SendEmailResponse,
@@ -146,14 +145,14 @@ async def open_email(email_id: str) -> dict[str, Any]:
         Dict with 'success' boolean or error message
     """
     try:
-        request = EmailAddress(email=email_id)
+        request = EmailIdRequest(email_id=email_id)
     except Exception as e:
-        return EmailAddress(
+        return EmailResponse(
             success=False, error=f"Invalid email ID: {str(e)}"
         ).model_dump()
 
     try:
-        url = f"https://mail.google.com/#all/{request.email}"
+        url = f"https://mail.google.com/#all/{request.email_id}"
         webbrowser.open(url, new=0, autoraise=True)
         return EmailResponse(success=True).model_dump()
     except Exception as error:

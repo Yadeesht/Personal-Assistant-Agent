@@ -42,9 +42,11 @@ async def log_event(thread_id: str, actor: str, message: str, metadata: dict = N
 
 
 def analyze_human_logs(
-    db_path="D:\\Agentic AI\\data\\memory.db",
+    db_path=None,
     output_file="utils/log_details.txt",
 ):
+    if db_path is None:
+        db_path = str(MEMORY_DB)
     try:
         # 1. Connect to your local SQLite file
         conn = sqlite3.connect(db_path)

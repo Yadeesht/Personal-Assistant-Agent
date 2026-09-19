@@ -530,8 +530,8 @@ async def modify_doc_text(
         underline: Whether to underline text (True/False/None to leave unchanged)
         font_size: Font size in points
         font_family: Font family name (e.g., "Arial", "Times New Roman")
-        text_color: Foreground text color (#RRGGBB or RGB tuple/list)
-        background_color: Background/highlight color (#RRGGBB or RGB tuple/list)
+        text_color: Foreground text color as a hex string (#RRGGBB)
+        background_color: Background/highlight color as a hex string (#RRGGBB)
 
     Returns:
         dict: A dictionary containing success status, document_id, operation, and web_view_link.
@@ -571,7 +571,13 @@ async def modify_doc_text(
 
         is_valid, error_msg = validator.validate_document_id(request.document_id)
         if not is_valid:
-            return f"Error: {error_msg}"
+            return ModifyDocTextResponse(
+                status="failed",
+                document_id=request.document_id,
+                operations=[],
+                web_view_link="",
+                error=f"Error: {error_msg}",
+            ).model_dump()
 
         # Validate that we have something to do
         if request.text is None and not any(
@@ -585,7 +591,13 @@ async def modify_doc_text(
                 request.background_color,
             ]
         ):
-            return "Error: Must provide either 'text' to insert/replace, or formatting parameters (bold, italic, underline, font_size, font_family, text_color, background_color)."
+            return ModifyDocTextResponse(
+                status="failed",
+                document_id=request.document_id,
+                operations=[],
+                web_view_link="",
+                error="Must provide either 'text' to insert/replace, or formatting parameters (bold, italic, underline, font_size, font_family, text_color, background_color).",
+            ).model_dump()
 
         # Validate text formatting params if provided
         if any(
@@ -609,17 +621,35 @@ async def modify_doc_text(
                 request.background_color,
             )
             if not is_valid:
-                return f"Error: {error_msg}"
+                return ModifyDocTextResponse(
+                    status="failed",
+                    document_id=request.document_id,
+                    operations=[],
+                    web_view_link="",
+                    error=f"Error: {error_msg}",
+                ).model_dump()
 
             # For formatting, we need end_index
             if request.end_index is None:
-                return "Error: 'end_index' is required when applying formatting."
+                return ModifyDocTextResponse(
+                    status="failed",
+                    document_id=request.document_id,
+                    operations=[],
+                    web_view_link="",
+                    error="'end_index' is required when applying formatting.",
+                ).model_dump()
 
             is_valid, error_msg = validator.validate_index_range(
                 request.start_index, request.end_index
             )
             if not is_valid:
-                return f"Error: {error_msg}"
+                return ModifyDocTextResponse(
+                    status="failed",
+                    document_id=request.document_id,
+                    operations=[],
+                    web_view_link="",
+                    error=f"Error: {error_msg}",
+                ).model_dump()
 
         requests = []
         operations = []
@@ -640,50 +670,54 @@ async def modify_doc_text(
                         create_delete_range_request(1 + len(request.text), adjusted_end)
                     )
                     operations.append(
-                        f"Replaced text from index {start_index} to {end_index}"
+                        f"Replaced text from index {request.start_index} to {request.end_index}"
                     )
                 else:
                     # Normal replacement: delete old text, then insert new text
                     requests.extend(
                         [
-                            create_delete_range_request(start_index, end_index),
-                            create_insert_text_request(start_index, text),
+                            create_delete_range_request(
+                                request.start_index, request.end_index
+                            ),
+                            create_insert_text_request(
+                                request.start_index, request.text
+                            ),
                         ]
                     )
                     operations.append(
-                        f"Replaced text from index {start_index} to {end_index}"
+                        f"Replaced text from index {request.start_index} to {request.end_index}"
                     )
             else:
                 # Text insertion
-                actual_index = 1 if start_index == 0 else start_index
-                requests.append(create_insert_text_request(actual_index, text))
-                operations.append(f"Inserted text at index {start_index}")
+                actual_index = 1 if request.start_index == 0 else request.start_index
+                requests.append(create_insert_text_request(actual_index, request.text))
+                operations.append(f"Inserted text at index {request.start_index}")
 
         # Handle formatting
         if any(
             [
-                bold is not None,
-                italic is not None,
-                underline is not None,
-                font_size,
-                font_family,
-                text_color,
-                background_color,
+                request.bold is not None,
+                request.italic is not None,
+                request.underline is not None,
+                request.font_size,
+                request.font_family,
+                request.text_color,
+                request.background_color,
             ]
         ):
             # Adjust range for formatting based on text operations
-            format_start = start_index
-            format_end = end_index
+            format_start = request.start_index
+            format_end = request.end_index
 
-            if text is not None:
-                if end_index is not None and end_index > start_index:
+            if request.text is not None:
+                if request.end_index is not None and request.end_index > request.start_index:
                     # Text was replaced - format the new text
-                    format_end = start_index + len(text)
+                    format_end = request.start_index + len(request.text)
                 else:
                     # Text was inserted - format the inserted text
-                    actual_index = 1 if start_index == 0 else start_index
+                    actual_index = 1 if request.start_index == 0 else request.start_index
                     format_start = actual_index
-                    format_end = actual_index + len(text)
+                    format_end = actual_index + len(request.text)
 
             # Handle special case for formatting at index 0
             if format_start == 0:
@@ -695,31 +729,31 @@ async def modify_doc_text(
                 create_format_text_request(
                     format_start,
                     format_end,
-                    bold,
-                    italic,
-                    underline,
-                    font_size,
-                    font_family,
-                    text_color,
-                    background_color,
+                    request.bold,
+                    request.italic,
+                    request.underline,
+                    request.font_size,
+                    request.font_family,
+                    request.text_color,
+                    request.background_color,
                 )
             )
 
             format_details = []
-            if bold is not None:
-                format_details.append(f"bold={bold}")
-            if italic is not None:
-                format_details.append(f"italic={italic}")
-            if underline is not None:
-                format_details.append(f"underline={underline}")
-            if font_size:
-                format_details.append(f"font_size={font_size}")
-            if font_family:
-                format_details.append(f"font_family={font_family}")
-            if text_color:
-                format_details.append(f"text_color={text_color}")
-            if background_color:
-                format_details.append(f"background_color={background_color}")
+            if request.bold is not None:
+                format_details.append(f"bold={request.bold}")
+            if request.italic is not None:
+                format_details.append(f"italic={request.italic}")
+            if request.underline is not None:
+                format_details.append(f"underline={request.underline}")
+            if request.font_size:
+                format_details.append(f"font_size={request.font_size}")
+            if request.font_family:
+                format_details.append(f"font_family={request.font_family}")
+            if request.text_color:
+                format_details.append(f"text_color={request.text_color}")
+            if request.background_color:
+                format_details.append(f"background_color={request.background_color}")
 
             operations.append(
                 f"Applied formatting ({', '.join(format_details)}) to range {format_start}-{format_end}"
@@ -727,11 +761,11 @@ async def modify_doc_text(
 
         await asyncio.to_thread(
             service.documents()
-            .batchUpdate(documentId=document_id, body={"requests": requests})
+            .batchUpdate(documentId=request.document_id, body={"requests": requests})
             .execute
         )
 
-        link = f"https://docs.google.com/document/d/{document_id}/edit"
+        link = f"https://docs.google.com/document/d/{request.document_id}/edit"
         operation_summary = "; ".join(operations)
         logger.info(f"Successfully modified doc {document_id}: {operation_summary}")
         return ModifyDocTextResponse(

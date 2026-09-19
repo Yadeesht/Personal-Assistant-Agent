@@ -18,7 +18,7 @@
   <a href="https://github.com/Yadeesht/Agentic-AI-EXP/blob/main/SYSTEM.md"><img src="https://img.shields.io/badge/System-Architecture-6f42c1?style=for-the-badge" alt="System Docs"></a>
 </p>
 
-This is a personal agentic AI operating system built on a distributed agent architecture and orchestrated with **LangGraph**. It routes tasks across specialized agents, executes code in a sandbox, and supports both text + voice interactions through the web interface.
+This is a personal agentic AI operating system built on a distributed agent architecture and orchestrated with **LangGraph**. It routes tasks across specialized agents and executes code in a sandbox, driven from a terminal session.
 
 ---
 
@@ -36,11 +36,10 @@ This is a personal agentic AI operating system built on a distributed agent arch
 - [2) Installation](#2-installation)
 - [3) Environment and credentials setup](#3-environment-and-credentials-setup)
 - [4) Run modes](#4-run-modes)
-- [5) Web server dashboard controls](#5-web-server-dashboard-controls)
-- [6) How to use (interactive examples)](#6-how-to-use-interactive-examples)
-- [7) Architecture overview](#7-architecture-overview)
-- [8) Project structure](#8-project-structure)
-- [9) Troubleshooting](#9-troubleshooting)
+- [5) How to use (interactive examples)](#5-how-to-use-interactive-examples)
+- [6) Architecture overview](#6-architecture-overview)
+- [7) Project structure](#7-project-structure)
+- [8) Troubleshooting](#8-troubleshooting)
 
 ---
 
@@ -92,10 +91,10 @@ uv pip install -r requirements.txt
 
 ### 3.1 Environment file
 
-This repository currently includes `.env,example` (comma in the name). Copy it to `.env`:
+This repository includes `.env.example`. Copy it to `.env`:
 
 ```powershell
-Copy-Item .env,example .env
+Copy-Item .env.example .env
 ```
 
 Fill values in `.env` (minimum):
@@ -148,15 +147,7 @@ models/
 
 ## 4) Run modes
 
-### A) Custom web dashboard (recommended)
-
-```powershell
-python frontend/web_server.py
-```
-
-Open the URL shown in terminal (typically `http://127.0.0.1:8080`).
-
-### B) Terminal mode (`main.py`)
+### Terminal mode (`main.py`)
 
 ```powershell
 python main.py
@@ -164,16 +155,13 @@ python main.py
 
 Use `exit`, `quit`, or `bye` to stop.
 
+> There is no web dashboard in this repository — it was removed in favor of
+> terminal-based access. To toggle the code agent on/off, edit
+> `data/enabled_tools.json` (`{"code_agent": false}`) directly.
 
 ---
 
-## 5) Web server dashboard controls
-
-From the dashboard page, you can chat with JARVIS, see real-time thought/action logs, configure environment variables, and toggle enabled tools.
-
----
-
-## 6) How to use (interactive examples)
+## 5) How to use (interactive examples)
 
 Use these prompts directly after startup:
 
@@ -189,7 +177,7 @@ Use these prompts directly after startup:
 ### Code automation
 - “Read CSV files in my Drive folder `Sales Data`, compute monthly totals, and write results to a Sheet called `Monthly Sales Summary`.”
 
-## 7) Architecture overview
+## 6) Architecture overview
 
 <p align="center">
   <img src="docs/images/agent_structure_graph.png" alt="JARVIS Agent Graph" width="900">
@@ -246,20 +234,19 @@ For full routing logic and state schema, see [SYSTEM.md](./SYSTEM.md).
 
 ---
 
-## 8) Project structure
+## 7) Project structure
 
 Key runtime files:
 
 - `main.py` — terminal interaction loop
-- `frontend/web_server.py` — FastAPI dashboard web server and static assets
 - `core/graph.py` — LangGraph orchestration
 - `config/settings.py` — model/provider/runtime configuration
-- `tools/*.py` — Tool registration entrypoints
+- `app_tools/tools/google/*.py` — Tool registration entrypoints
 - `rag/` — Episodic RAG + Knowledge Graph logic
 
 ---
 
-## 9) Troubleshooting
+## 8) Troubleshooting
 
 <details>
 <summary><strong>Web server starts but no responses</strong></summary>

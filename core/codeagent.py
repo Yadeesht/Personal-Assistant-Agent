@@ -294,12 +294,13 @@ class CodeExecutionAgent:
         Follow this template strictly:
         ```python
         import asyncio
+        import json
         from typing import Dict, Any, List
 
         async def execute_workflow() -> Dict[str, Any]:
             # Step 1: Call tool with await
             result = await tool_name(param1="value")
-            
+
             # Step 2: Check for errors
             if result.get("error"):
                 return {{
@@ -307,19 +308,20 @@ class CodeExecutionAgent:
                     "details": {{"error": result["error"]}},
                     "artifacts": []
                 }}
-            
+
             # Step 3: Process successful results
             data = result.get("data", [])
-            
+
             return {{
-                "summary": f"Successfully processed {{len(data)}} items", 
+                "summary": f"Successfully processed {{len(data)}} items",
                 "details": {{"count": len(data), "items": data}},
                 "artifacts": []
             }}
-        
+
         if __name__ == "__main__":
             result = asyncio.run(execute_workflow())
-            print(result)
+            # Must print valid JSON (not a Python dict repr) so the caller can parse it.
+            print(json.dumps(result, default=str))
         ```
         """
 
@@ -364,17 +366,13 @@ class CodeExecutionAgent:
             wrapper_func = f"""
 async def {tool_name}(**kwargs):
     try:
-        with httpx.Client() as client:
-            r = client.post(
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.post(
                 "http://127.0.0.1:8080/api/sandbox/execute_tool",
                 json={{"tool_name": "{tool_name}", "arguments": kwargs}},
-                timeout=30.0
             )
             if r.status_code == 200:
-                res = r.json()
-                if isinstance(res, dict) and "error" in res and not res.get("success", True):
-                    return res
-                return res
+                return r.json()
             else:
                 return {{"error": f"Tool HTTP error: {{r.status_code}}", "success": False}}
     except Exception as e:
@@ -387,8 +385,16 @@ async def {tool_name}(**kwargs):
     async def _execute_in_sandbox(self, code: str, tool_map: Dict[str, Callable] = None) -> Dict[str, Any]:
         """Execute in local Python Code Sandbox Server on Port 9000"""
         import httpx
+        from core.tool_bridge import ensure_bridge_running, set_active_tool_map
+
         await self._ensure_sandbox_server_running()
-        
+
+        # The sandbox subprocess calls back into this process (via the tool
+        # bridge on port 8080) to actually invoke tools that need live
+        # credentials/services held here.
+        set_active_tool_map(tool_map)
+        await ensure_bridge_running()
+
         full_code = self._prepend_tool_wrappers(code, tool_map)
         
         try:

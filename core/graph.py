@@ -21,6 +21,7 @@ from core.agent import (
 from core.state import (
     State,
     internal_agent_route,
+    route_after_code_agent,
     route_after_supervisor,
     route_after_supervisor_tools,
     route_after_communication_tools,
@@ -45,19 +46,41 @@ def create_agent_tool_node(tools, messages_key: str):
 
     async def node(state: State):
         result = await tool_node.ainvoke(state)
-        
+
         from langgraph.types import Command
+
         if isinstance(result, Command):
             return result
-        if isinstance(result, list):
-            for item in result:
-                if isinstance(item, Command):
-                    return item
 
-        # The result contains the newly added ToolMessages under the messages_key, or is a list of messages directly
         if isinstance(result, list):
-            tool_messages = result
-        elif isinstance(result, dict):
+            # A single AIMessage can carry multiple tool_calls. If any of
+            # them (e.g. route_to_agent, work_completion) returns a Command,
+            # ToolNode.ainvoke gives back a list mixing Command objects with
+            # plain ToolMessages for the other calls. Every one of them must
+            # be applied — returning only the first Command silently drops
+            # the rest, leaving their tool_call_ids unanswered and breaking
+            # the next LLM request.
+            commands = [item for item in result if isinstance(item, Command)]
+            plain_messages = [item for item in result if not isinstance(item, Command)]
+
+            if plain_messages:
+                commands.append(
+                    Command(
+                        update={
+                            messages_key: plain_messages,
+                            "messages": plain_messages,
+                        }
+                    )
+                )
+
+            if commands:
+                # LangGraph applies every Command in a returned list.
+                return commands
+
+            return {messages_key: [], "messages": []}
+
+        # Single dict result: the newly added ToolMessages live under messages_key.
+        if isinstance(result, dict):
             tool_messages = result.get(messages_key, [])
         else:
             tool_messages = []
@@ -87,7 +110,8 @@ def build_graph(tool_sets, checkpointer):
         t
         for t in content_tools
         if any(
-            keyword in t.name.lower() for keyword in ["sheet", "form", "spreadsheet"]
+            keyword in t.name.lower()
+            for keyword in ["sheet", "form", "spreadsheet", "publish"]
         )
     ]
 
@@ -246,7 +270,14 @@ def build_graph(tool_sets, checkpointer):
         },
     )
 
-    builder.add_edge("code_agent", "supervisor")
+    builder.add_conditional_edges(
+        "code_agent",
+        route_after_code_agent,
+        {
+            "supervisor": "supervisor",
+            "END": END,
+        },
+    )
 
     builder.add_conditional_edges(
         "communication_agent",

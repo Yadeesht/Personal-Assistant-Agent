@@ -207,13 +207,17 @@ request_counter = RequestTracker()
 def delete_thread_from_db(thread_id: str):
     """Clear memory for a specific thread"""
 
+    # AsyncSqliteSaver stores checkpoints across two tables, "checkpoints"
+    # and "writes" (there is no "messages" table). See
+    # utils/memory_manager.py:analyze_checkpoint_db for the same schema.
     conn = sqlite3.connect(CHECKPOINT_DB)
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM messages WHERE thread_id = ?", (thread_id,))
+    cursor.execute("DELETE FROM checkpoints WHERE thread_id = ?", (thread_id,))
     deleted = cursor.rowcount
+    cursor.execute("DELETE FROM writes WHERE thread_id = ?", (thread_id,))
     conn.commit()
     conn.close()
-    print(f"✅ Deleted {deleted} messages from thread: {thread_id}")
+    print(f"✅ Deleted {deleted} checkpoints for thread: {thread_id}")
 
 
 def get_current_time():
@@ -224,7 +228,10 @@ def get_current_time():
 def format_tool_to_text(tool_name, tool_args_str):
     try:
         args = json.loads(tool_args_str)
-    except:
+    except (json.JSONDecodeError, TypeError):
+        return f"[Action: {tool_name}] (Args: {tool_args_str})"
+
+    if not isinstance(args, dict):
         return f"[Action: {tool_name}] (Args: {tool_args_str})"
 
     arg_summary = ", ".join([f"{k}={v}" for k, v in args.items()])

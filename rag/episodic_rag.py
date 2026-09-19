@@ -216,7 +216,7 @@ class EpisodicRAG:
                 SELECT timestamp, actor, message, metadata
                 FROM human_logs 
                 WHERE timestamp > ? 
-                AND actor NOT IN ('supervisor_routing', 'summerizer_node')   # change this please
+                AND actor NOT IN ('supervisor_routing', 'summerizer_node')
                 AND COALESCE(json_extract(metadata, '$.type'), '') != 'tool_call'
                 ORDER BY timestamp ASC
             """
@@ -236,7 +236,7 @@ class EpisodicRAG:
             current_ts_obj = None
             actors = set()
 
-            for timestamp, actor, message in rows:
+            for timestamp, actor, message, _metadata in rows:
                 try:
                     ts_obj = datetime.fromisoformat(timestamp)
                 except ValueError:
@@ -295,7 +295,7 @@ class EpisodicRAG:
 
                 current_actors = episode.get("actors")
                 if not current_actors:
-                    current_actors = set("supervisor")
+                    current_actors = ["supervisor"]
 
                 if not ep_clean:
                     continue
@@ -427,6 +427,7 @@ class EpisodicRAG:
             return []
 
     def index_creation(self, final_chunks):
+        client = None
         try:
             client = QdrantClient(path=EPISODIC_RAG_DB)
 
@@ -468,8 +469,12 @@ class EpisodicRAG:
 
         except Exception as e:
             logger.error(f"Error during index creation: {e}")
+        finally:
+            if client is not None:
+                client.close()
 
     def retrieve_chunks(self, query, conditions=None, top_k=5):
+        client = None
         try:
             if conditions is None:
                 conditions = {}
@@ -490,10 +495,13 @@ class EpisodicRAG:
                 )
 
             if conditions.get("start_time") and conditions.get("end_time"):
+                # "timestamp" is stored as an ISO-8601 string, so a numeric
+                # Range would raise a validation error — DatetimeRange accepts
+                # ISO-8601 strings directly.
                 must.append(
                     models.FieldCondition(
                         key="timestamp",
-                        range=models.Range(
+                        range=models.DatetimeRange(
                             gte=conditions["start_time"], lte=conditions["end_time"]
                         ),
                     )
@@ -548,6 +556,8 @@ class EpisodicRAG:
                     for s in siblings:
                         seen_ids.add(s.id)
 
+                    continue
+
                 if score > 0.75:
                     context_block = [chunk["content"]]
 
@@ -595,3 +605,6 @@ class EpisodicRAG:
         except Exception as e:
             logger.info(f"Error during chunk retrieval: {e}")
             return None
+        finally:
+            if client is not None:
+                client.close()

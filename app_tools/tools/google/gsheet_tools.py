@@ -801,14 +801,30 @@ async def read_sheet_values(
                 status="success", message=message
             ).model_dump_json(indent=2)
 
+        # Resolve the actual sheet row number the range starts at, so labels
+        # reflect real sheet coordinates instead of always starting at 1 —
+        # e.g. reading "Sheet1!A10:D15" should label the first row "Row 10",
+        # not "Row 1" (which would mislead a caller into writing back to the
+        # wrong row).
+        start_row_number = 1
+        try:
+            _, a1_range = _split_sheet_and_range(request.range_name)
+            if a1_range:
+                start_part = a1_range.split(":", 1)[0]
+                _, start_row_idx = _parse_a1_part(start_part)
+                if start_row_idx is not None:
+                    start_row_number = start_row_idx + 1
+        except UserInputError:
+            pass
+
         # Format the output as a readable table
         formatted_rows = []
-        for i, row in enumerate(values, 1):
+        for offset, row in enumerate(values):
             # Pad row with empty strings to show structure
             padded_row = (
                 row + [""] * max(0, len(values[0]) - len(row)) if values else row
             )
-            formatted_rows.append(f"Row {i:2d}: {padded_row}")
+            formatted_rows.append(f"Row {start_row_number + offset:2d}: {padded_row}")
 
         message = (
             f"Successfully read {len(values)} rows from range '{request.range_name}' in spreadsheet {request.spreadsheet_id}:\n"

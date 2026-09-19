@@ -1,4 +1,5 @@
 import asyncio
+import threading
 import time
 from datetime import datetime
 
@@ -48,18 +49,33 @@ AGENT_MESSAGE_KEY = {
 }
 
 
-async def keyword_listener(queue, loop, agent_state):
+def keyword_listener(queue: asyncio.Queue, loop: asyncio.AbstractEventLoop, agent_state):
+    """Read stdin on a dedicated daemon thread.
+
+    `loop.run_in_executor(None, input)` schedules the blocking read on
+    asyncio's default ThreadPoolExecutor, which `asyncio.run()` waits on
+    (`loop.shutdown_default_executor()`) before the process can exit. That
+    made the process hang after "Goodbye!" until one more Enter press
+    unblocked the pending input() call. A plain daemon thread isn't awaited
+    by asyncio.run(), so the process can exit immediately.
+    """
     while True:
         try:
-            user_input = await loop.run_in_executor(None, input)
-            if user_input.strip():
-                agent_state["last_interaction"] = time.time()
-                await queue.put(("TEXT", user_input.strip()))
+            user_input = input()
         except EOFError:
             break
         except Exception as e:
             logger.error(f"Error in keyword listener: {e}")
-            await asyncio.sleep(1)
+            continue
+
+        if user_input.strip():
+            agent_state["last_interaction"] = time.time()
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    queue.put(("TEXT", user_input.strip())), loop
+                ).result()
+            except Exception as e:
+                logger.error(f"Failed to enqueue user input: {e}")
 
 
 async def main():
@@ -111,10 +127,16 @@ async def main():
             event_queue = asyncio.Queue()
             loop = asyncio.get_running_loop()
 
-            asyncio.create_task(keyword_listener(event_queue, loop, agent_state))
+            threading.Thread(
+                target=keyword_listener,
+                args=(event_queue, loop, agent_state),
+                daemon=True,
+            ).start()
 
             logger.info("⌨️ Type your message")
             logger.info("💡 Type 'exit' or 'quit' to stop\n")
+
+            state = {"messages": []}
 
             while True:
                 _, query = await event_queue.get()

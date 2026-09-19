@@ -123,7 +123,7 @@ async def add_information_to_knowledge_graph(details: str):
                     kg.add_entity,
                     node_id=entity["id"],
                     node_type=entity.get("type", "unknown"),
-                    search_keywords=", ".join(entity.get("keywords", [])),
+                    search_keywords=", ".join(entity.get("search_keywords", [])),
                     description=entity.get("description", ""),
                 )
             elif action == "UPDATE":
@@ -131,7 +131,7 @@ async def add_information_to_knowledge_graph(details: str):
                     kg.add_entity,
                     node_id=entity["id"],
                     node_type=entity.get("type", "unknown"),
-                    search_keywords=", ".join(entity.get("keywords", [])),
+                    search_keywords=", ".join(entity.get("search_keywords", [])),
                     description=entity.get("description", ""),
                 )
 

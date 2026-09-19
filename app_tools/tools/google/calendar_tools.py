@@ -34,6 +34,11 @@ from utils.helper import setup_logger
 
 logger = setup_logger(__name__)
 
+# This module's contract (see create_event/modify_event docstrings) is that
+# all naive timestamps are Indian Standard Time, not UTC.
+CALENDAR_TIMEZONE = "Asia/Kolkata"
+CALENDAR_UTC_OFFSET = "+05:30"
+
 
 # auth
 def get_service():
@@ -265,8 +270,9 @@ def _correct_time_format_for_api(
         try:
             # Validate it's a proper date
             datetime.datetime.strptime(time_str, "%Y-%m-%d")
-            # For date-only, append T00:00:00Z to make it RFC3339 compliant
-            formatted = f"{time_str}T00:00:00Z"
+            # For date-only, append midnight IST to make it RFC3339 compliant
+            # (this module treats naive timestamps as IST, not UTC).
+            formatted = f"{time_str}T00:00:00{CALENDAR_UTC_OFFSET}"
             logger.info(
                 f"Formatting date-only {param_name} '{time_str}' to RFC3339: '{formatted}'"
             )
@@ -287,15 +293,15 @@ def _correct_time_format_for_api(
         )
     ):
         try:
-            # Validate the format before appending 'Z'
+            # Validate the format before appending the IST offset
             datetime.datetime.strptime(time_str, "%Y-%m-%dT%H:%M:%S")
             logger.info(
-                f"Formatting {param_name} '{time_str}' by appending 'Z' for UTC."
+                f"Formatting {param_name} '{time_str}' by appending '{CALENDAR_UTC_OFFSET}' (IST)."
             )
-            return time_str + "Z"
+            return time_str + CALENDAR_UTC_OFFSET
         except ValueError:
             logger.warning(
-                f"{param_name} '{time_str}' looks like it needs 'Z' but is not valid YYYY-MM-DDTHH:MM:SS. Using as is."
+                f"{param_name} '{time_str}' looks like it needs a timezone offset but is not valid YYYY-MM-DDTHH:MM:SS. Using as is."
             )
             return time_str
 

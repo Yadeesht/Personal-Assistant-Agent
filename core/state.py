@@ -25,7 +25,8 @@ class State(TypedDict):
     data_messages: Annotated[list, add_messages]
     code_messages: Annotated[list, add_messages]
     summary: Optional[str]
-    last_memory_timestamp: Optional[float] 
+    last_memory_timestamp: Optional[float]
+    last_knowledgegraph_timestamp: Optional[float]
     next: Optional[str]
     current_agent: Optional[str]
 
@@ -119,6 +120,19 @@ def route_after_data_tools(state: State):
 
 def route_after_presentation_tools(state: State):
     return "supervisor" if state.get("current_agent") == "supervisor" else "presentation_agent"
+
+
+def route_after_code_agent(state: State) -> str:
+    """Route after the code_agent node runs.
+
+    code_executor sets current_agent back to "code_agent" while it is waiting
+    on the user to approve generated code — in that case the turn must end
+    here (not fall through to supervisor) so the approval request actually
+    reaches the user and the next turn resumes directly in code_agent.
+    Once execution has actually happened (success or error), current_agent is
+    set to "supervisor" and control hands off normally.
+    """
+    return "supervisor" if state.get("current_agent") == "supervisor" else "END"
 
 
 def internal_agent_route(state: State) -> str:

@@ -136,9 +136,8 @@ def get_google_service(
         with open(token_path, "w") as token:
             token.write(creds.to_json())
 
-    api_service_name = "chat" if service_type == "gchat" else service_type
-    api_service_name = "drive" if service_type == "gdrive" else service_type
-    api_service_name = "tasks" if service_type == "task" else service_type
+    api_name_overrides = {"gchat": "chat", "gdrive": "drive"}
+    api_service_name = api_name_overrides.get(service_type, service_type)
     version = (
         "v1"
         if service_type in ["gmail", "gchat", "tasks", "slides", "forms", "docs"]

@@ -1,4 +1,3 @@
-from unittest import result
 import kuzu
 from pathlib import Path
 import json
@@ -58,9 +57,8 @@ class KnowledgeGraph:
         if self._model is None:
             try:
                 if not Path(EMBEDDING_BGE_MODEL_PATH).exists():
-                    SentenceTransformer.download_model(
-                        "BAAI/bge-small", EMBEDDING_BGE_MODEL_PATH
-                    )
+                    downloaded = SentenceTransformer("BAAI/bge-small-en-v1.5")
+                    downloaded.save(str(EMBEDDING_BGE_MODEL_PATH))
                 self._model = SentenceTransformer(EMBEDDING_BGE_MODEL_PATH)
 
                 logger.info("SentenceTransformer model loaded successfully.")
@@ -149,7 +147,9 @@ class KnowledgeGraph:
             )
             embedding = self._compute_embedding(text)
 
-            delete_query = f"MATCH (n:Entity {{id: '{node_id}'}}) DETACH DELETE n"
+            safe_id = node_id.replace("'", "\\'")
+
+            delete_query = f"MATCH (n:Entity {{id: '{safe_id}'}}) DETACH DELETE n"
             self.execute_query(delete_query)
 
             safe_desc = description.replace("'", "\\'")
@@ -157,10 +157,10 @@ class KnowledgeGraph:
 
             query = f"""
             CREATE (n:Entity {{
-                id: '{node_id}',
-                type: '{node_type}', 
+                id: '{safe_id}',
+                type: '{node_type}',
                 search_keywords: '{safe_keywords}',
-                description: '{safe_desc}', 
+                description: '{safe_desc}',
                 embedding: {embedding}
             }})
             """
@@ -279,13 +279,14 @@ class KnowledgeGraph:
             query_embedding = self._compute_embedding(keywords)
 
             query = """
-                CALL QUERY_VECTOR_INDEX('Entity', 'Entity_embedding_idx', CAST($query_embedding, 'FLOAT[384]'), $top_k)
-                WITH node AS n, score
+                CALL QUERY_VECTOR_INDEX('Entity', 'Entity_embedding_idx', $query_embedding, $top_k)
+                YIELD node, distance
+                WITH node AS n, (1 - distance) AS score
                 WHERE score > 0.35
-                RETURN 
-                    n.id AS id, 
-                    n.type AS type, 
-                    n.description AS description,  
+                RETURN
+                    n.id AS id,
+                    n.type AS type,
+                    n.description AS description,
                     score AS base_score
                 ORDER BY base_score DESC
                 LIMIT $top_k
@@ -383,8 +384,9 @@ class KnowledgeGraph:
                 query_embedding = self._compute_embedding(text)
 
                 query = """
-                CALL QUERY_VECTOR_INDEX('Entity', 'Entity_embedding_idx', CAST($query_embedding, 'FLOAT[384]'), 10)
-                WITH node AS n, score
+                CALL QUERY_VECTOR_INDEX('Entity', 'Entity_embedding_idx', $query_embedding, 10)
+                YIELD node, distance
+                WITH node AS n, (1 - distance) AS score
                 WHERE score > 0.6
                 OPTIONAL MATCH (n)-[r:RELATED_TO]-(m:Entity)
                 WITH n, score, collect(r.relation_type + ' with ' + m.id) AS connections
