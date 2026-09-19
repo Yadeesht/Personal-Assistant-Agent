@@ -243,7 +243,6 @@ For full routing logic and state schema, see [SYSTEM.md](./SYSTEM.md).
 Key runtime files:
 
 - `main.py` — terminal interaction loop
-- `frontend/web_server.py` — FastAPI dashboard web server and static assets
 - `core/graph.py` — LangGraph orchestration
 - `config/settings.py` — model/provider/runtime configuration
 - `tools/*.py` — Tool registration entrypoints
