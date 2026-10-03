@@ -26,12 +26,8 @@ planning_server = ToolRegistry("Planning Server")
 # Content Server
 content_server = ToolRegistry("Content Server")
 
-# Supervisor Server
-supervisor_server = ToolRegistry("Supervisor Server")
-
 __all__ = [
     "communication_server",
     "planning_server",
     "content_server",
-    "supervisor_server",
 ]

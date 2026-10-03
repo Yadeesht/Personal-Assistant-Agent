@@ -132,7 +132,7 @@ async def search_docs(
         ).model_dump()
 
     try:
-        service = get_service()
+        service = drive_get_service()
         logger.info(f"[search_docs] Query='{query}'")
 
         escaped_query = request.query.replace("'", "\\'")
@@ -405,7 +405,7 @@ async def list_docs_in_folder(folder_id: str = "root", page_size: int = 100) -> 
         ).model_dump()
 
     try:
-        service = get_service()
+        service = drive_get_service()
         logger.info(f"[list_docs_in_folder] Invoked. Folder ID: '{folder_id}'")
 
         rsp = await asyncio.to_thread(
@@ -1111,7 +1111,10 @@ async def insert_doc_image(
 
         # Use helper to create image request
         requests = [
-            create_insert_image_request(index, image_uri, request.width, request.height)
+            # 0 means "not given": sending it would set a real size of 0.
+            create_insert_image_request(
+                index, image_uri, request.width or None, request.height or None
+            )
         ]
 
         await asyncio.to_thread(
@@ -1275,8 +1278,10 @@ async def batch_update_doc(
         # Use BatchOperationManager to handle the complex logic
         batch_manager = BatchOperationManager(service)
 
+        # The manager works on plain dicts, not DocOperation models.
         success, message, metadata = await batch_manager.execute_batch_operations(
-            request.document_id, request.operations
+            request.document_id,
+            [op.model_dump(exclude_none=True) for op in request.operations],
         )
 
         link = f"https://docs.google.com/document/d/{request.document_id}/edit"
@@ -1371,58 +1376,58 @@ async def inspect_doc_structure(
             # Return full parsed structure
             structure = parse_document_structure(doc)
 
-        # Simplify for JSON serialization
-        result = {
-            "title": structure["title"],
-            "total_length": structure["total_length"],
-            "statistics": {
-                "elements": len(structure["body"]),
-                "tables": len(structure["tables"]),
-                "paragraphs": sum(
-                    1 for e in structure["body"] if e.get("type") == "paragraph"
-                ),
-                "has_headers": bool(structure["headers"]),
-                "has_footers": bool(structure["footers"]),
-            },
-            "elements": [],
-        }
-
-        # Add element summaries
-        for element in structure["body"]:
-            elem_summary = {
-                "type": element["type"],
-                "start_index": element["start_index"],
-                "end_index": element["end_index"],
+            # Simplify for JSON serialization
+            result = {
+                "title": structure["title"],
+                "total_length": structure["total_length"],
+                "statistics": {
+                    "elements": len(structure["body"]),
+                    "tables": len(structure["tables"]),
+                    "paragraphs": sum(
+                        1 for e in structure["body"] if e.get("type") == "paragraph"
+                    ),
+                    "has_headers": bool(structure["headers"]),
+                    "has_footers": bool(structure["footers"]),
+                },
+                "elements": [],
             }
 
-            if element["type"] == "table":
-                elem_summary["rows"] = element["rows"]
-                elem_summary["columns"] = element["columns"]
-                elem_summary["cell_count"] = len(element.get("cells", []))
-            elif element["type"] == "paragraph":
-                elem_summary["text_preview"] = element.get("text", "")[:100]
+            # Add element summaries
+            for element in structure["body"]:
+                elem_summary = {
+                    "type": element["type"],
+                    "start_index": element["start_index"],
+                    "end_index": element["end_index"],
+                }
 
-            result["elements"].append(elem_summary)
+                if element["type"] == "table":
+                    elem_summary["rows"] = element["rows"]
+                    elem_summary["columns"] = element["columns"]
+                    elem_summary["cell_count"] = len(element.get("cells", []))
+                elif element["type"] == "paragraph":
+                    elem_summary["text_preview"] = element.get("text", "")[:100]
 
-        # Add table details
-        if structure["tables"]:
-            result["tables"] = []
-            for i, table in enumerate(structure["tables"]):
-                table_data = extract_table_as_data(table)
-                result["tables"].append(
-                    {
-                        "index": i,
-                        "position": {
-                            "start": table["start_index"],
-                            "end": table["end_index"],
-                        },
-                        "dimensions": {
-                            "rows": table["rows"],
-                            "columns": table["columns"],
-                        },
-                        "preview": table_data[:3] if table_data else [],  # First 3 rows
-                    }
-                )
+                result["elements"].append(elem_summary)
+
+            # Add table details
+            if structure["tables"]:
+                result["tables"] = []
+                for i, table in enumerate(structure["tables"]):
+                    table_data = extract_table_as_data(table)
+                    result["tables"].append(
+                        {
+                            "index": i,
+                            "position": {
+                                "start": table["start_index"],
+                                "end": table["end_index"],
+                            },
+                            "dimensions": {
+                                "rows": table["rows"],
+                                "columns": table["columns"],
+                            },
+                            "preview": table_data[:3] if table_data else [],  # First 3 rows
+                        }
+                    )
 
         else:
             # Return basic analysis
@@ -1443,14 +1448,12 @@ async def inspect_doc_structure(
                         }
                     )
 
-            logger.info(
-                f"Successfully inspected structure of doc {request.document_id}"
-            )
-            return InspectDocStructureResponse(
-                status="success",
-                document_id=request.document_id,
-                structure=result,
-            ).model_dump()
+        logger.info(f"Successfully inspected structure of doc {request.document_id}")
+        return InspectDocStructureResponse(
+            status="success",
+            document_id=request.document_id,
+            structure=result,
+        ).model_dump()
 
     except Exception as error:
         logger.error(
@@ -1745,7 +1748,7 @@ async def export_doc_to_pdf(
         ).model_dump()
 
     try:
-        service = get_service()
+        service = drive_get_service()
         logger.info(
             f"[export_doc_to_pdf] Doc={request.document_id}, pdf_filename={request.pdf_filename}, folder_id={request.folder_id}"
         )
@@ -1786,10 +1789,10 @@ async def export_doc_to_pdf(
 
         # Export the document as PDF
         try:
+            # files.export only accepts fileId and mimeType.
             request_obj = service.files().export_media(
                 fileId=request.document_id,
                 mimeType="application/pdf",
-                supportsAllDrives=True,
             )
 
             fh = io.BytesIO()

@@ -1,25 +1,33 @@
 import logging
 import sqlite3
+import sys
 import tiktoken
 from datetime import datetime
-from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 import pytz
+from rich.console import Console
+from rich.logging import RichHandler
 
 import re
 import html
-import asyncio
-import aiosqlite
-import json
+import unicodedata
 from config.settings import CHECKPOINT_DB
-from config.settings import DEFAULT_THREAD_ID
 
 
 def clean_email_body(text: str) -> str:
     # 1. Decode HTML entities (e.g., convert &#39; to ')
     text = html.unescape(text)
 
-    # 2. Strip ZWNJ and other invisible junk
-    text = re.sub(r"[^\x20-\x7e]", r"", text)
+    # 2. Strip ZWNJ and other invisible junk: format/control characters plus the
+    #    combining grapheme joiner used as preheader padding. Whitespace stays for
+    #    step 4 (so lines don't run together) and visible text such as ₹, — and
+    #    accented letters is kept.
+    text = "".join(
+        ch
+        for ch in text
+        if ch.isspace()
+        or (unicodedata.category(ch) not in ("Cf", "Cc") and ch != "͏")
+    )
 
     # 3. Remove repeated special characters (like those divider lines -----)
     text = re.sub(r"[-*=_]{3,}", " ", text)
@@ -33,46 +41,6 @@ def clean_email_body(text: str) -> str:
     text = re.sub(r"\[Awesome\]|\[Decent\]|\[Not Great\]", "", text)
 
     return text
-
-
-# This class does the short-term memory thing by adding ad summerizing the context in real-time
-class AsyncSqliteSaver(AsyncSqliteSaver):
-    async def aput(self, config, checkpoint, metadata, new_versions):
-        """Save checkpoint with cleaned messages"""
-
-        return await super().aput(config, checkpoint, metadata, new_versions)
-
-
-mock_tool_sets = {"communication": [], "planning": [], "content": [], "supervisor": []}
-
-
-async def get_agent_state(thread_id: str):
-    async with aiosqlite.connect(str(CHECKPOINT_DB)) as conn:
-        checkpointer = AsyncSqliteSaver(conn)
-
-        from core.graph import build_graph
-
-        graph = build_graph(mock_tool_sets, checkpointer)
-
-        config = {"configurable": {"thread_id": thread_id}}
-
-        snapshot = await graph.aget_state(config)
-
-        if not snapshot.values:
-            print("❌ No state found for this thread ID.")
-            return
-
-        values = snapshot.values
-        print("=" * 40)
-        print(f"📊 STATE FOR THREAD: {thread_id}")
-        print("=" * 40)
-        print(
-            f"🕒 Last Memory Timestamp: {datetime.fromtimestamp(values.get('last_memory_timestamp')) if values.get('last_memory_timestamp') else 'N/A'}"
-        )
-        print(f"🧠 Summary: {values.get('summary')}")
-        print(f"📨 Total Messages: {len(values.get('messages', []))}")
-        print(f"🔜 Next Step: {snapshot.next}")
-        print("=" * 40)
 
 
 def count_tokens(messages):
@@ -112,13 +80,34 @@ def count_tokens(messages):
     return num_tokens
 
 
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+console = Console()
+
+
 def setup_logger(name: str = __name__) -> logging.Logger:
-    """Configure and return a logger instance"""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+    """Configure and return a logger instance with clean Rich formatting"""
+    root_logger = logging.getLogger()
+    if not any(isinstance(h, RichHandler) for h in root_logger.handlers):
+        root_logger.handlers = [
+            h for h in root_logger.handlers if not isinstance(h, logging.StreamHandler)
+        ]
+        handler = RichHandler(
+            console=console,
+            rich_tracebacks=True,
+            show_path=False,
+            markup=False,
+            omit_repeated_times=False,
+        )
+        handler.setFormatter(logging.Formatter("%(message)s", datefmt="[%X]"))
+        root_logger.addHandler(handler)
+        root_logger.setLevel(logging.INFO)
     return logging.getLogger(name)
 
 
@@ -208,8 +197,7 @@ def delete_thread_from_db(thread_id: str):
     """Clear memory for a specific thread"""
 
     # AsyncSqliteSaver stores checkpoints across two tables, "checkpoints"
-    # and "writes" (there is no "messages" table). See
-    # utils/memory_manager.py:analyze_checkpoint_db for the same schema.
+    # and "writes" (there is no "messages" table).
     conn = sqlite3.connect(CHECKPOINT_DB)
     cursor = conn.cursor()
     cursor.execute("DELETE FROM checkpoints WHERE thread_id = ?", (thread_id,))
@@ -225,18 +213,60 @@ def get_current_time():
     return now.strftime("%Y-%m-%d %H:%M:%S IST")
 
 
-def format_tool_to_text(tool_name, tool_args_str):
-    try:
-        args = json.loads(tool_args_str)
-    except (json.JSONDecodeError, TypeError):
-        return f"[Action: {tool_name}] (Args: {tool_args_str})"
+def sanitize_history(messages):
+    clean_history = []
 
-    if not isinstance(args, dict):
-        return f"[Action: {tool_name}] (Args: {tool_args_str})"
+    for msg in messages:
+        # 1. Handle Human Messages (includes agent reports sent as HumanMessage)
+        if isinstance(msg, HumanMessage):
+            entry = {
+                "role": "user",
+                "name": getattr(msg, "name", None) or "human",
+                "content": msg.content[:500] + "..."
+                if isinstance(msg.content, str) and len(msg.content) > 500
+                else msg.content,
+            }
+            clean_history.append(entry)
 
-    arg_summary = ", ".join([f"{k}={v}" for k, v in args.items()])
-    return f"__Tool Action__: Used {tool_name} with inputs: {arg_summary}"
+        # 2. Handle AI Messages
+        elif isinstance(msg, AIMessage):
+            # msg.name is where the actual agent name is stored
+            agent_name = getattr(msg, "name", None) or msg.additional_kwargs.get(
+                "agent_name", "unknown_agent"
+            )
+            routed_to = msg.additional_kwargs.get("routed_to")
 
+            entry = {
+                "role": "assistant",
+                "agent": agent_name,
+                "content": msg.content[:500] + "..."
+                if isinstance(msg.content, str) and len(msg.content) > 500
+                else (msg.content or ""),
+            }
 
-if __name__ == "__main__":
-    asyncio.run(get_agent_state(DEFAULT_THREAD_ID))
+            if routed_to:
+                entry["routed_to"] = routed_to
+
+            if msg.tool_calls:
+                entry["tool_calls"] = [
+                    {"name": tool["name"], "args": tool["args"]}
+                    for tool in msg.tool_calls
+                ]
+
+            clean_history.append(entry)
+
+        # 3. Handle Tool Results
+        elif isinstance(msg, ToolMessage):
+            result = msg.content
+            if isinstance(result, str) and len(result) > 300:
+                result = result[:300] + "..."
+            clean_history.append(
+                {
+                    "role": "tool_result",
+                    "tool_name": getattr(msg, "name", None) or msg.tool_call_id,
+                    "tool_call_id": msg.tool_call_id,
+                    "result": result,
+                }
+            )
+
+    return clean_history

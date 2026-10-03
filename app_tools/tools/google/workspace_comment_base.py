@@ -2,7 +2,7 @@
 Core Comments Module
 
 This module provides reusable comment management functions for Google Workspace applications.
-All Google Workspace apps (Docs, Sheets, Slides) use the Drive API for comment operations.
+Google Docs and Sheets both use the Drive API for comment operations.
 """
 
 import asyncio
@@ -35,8 +35,8 @@ def create_comment_tools(app_name: str, file_id_param: str):
     Factory function to create comment management tools for a specific Google Workspace app.
 
     Args:
-        app_name: Name of the app (e.g., "document", "spreadsheet", "presentation")
-        file_id_param: Parameter name for the file ID (e.g., "document_id", "spreadsheet_id", "presentation_id")
+        app_name: Name of the app ("document" or "spreadsheet")
+        file_id_param: Parameter name for the file ID ("document_id" or "spreadsheet_id")
 
     Returns:
         Dict containing the four comment management functions with unique names
@@ -113,38 +113,6 @@ def create_comment_tools(app_name: str, file_id_param: str):
                 service, app_name, spreadsheet_id, comment_id
             )
 
-    elif file_id_param == "presentation_id":
-
-        async def read_comments(presentation_id: str) -> str:
-            """Read all comments from a Google Presentation."""
-            service = get_service()
-            return await _read_comments_impl(service, app_name, presentation_id)
-
-        async def create_comment(presentation_id: str, comment_content: str) -> str:
-            """Create a new comment on a Google Presentation."""
-            service = get_service()
-            return await _create_comment_impl(
-                service, app_name, presentation_id, comment_content
-            )
-
-        async def reply_to_comment(
-            presentation_id: str,
-            comment_id: str,
-            reply_content: str,
-        ) -> str:
-            """Reply to a specific comment in a Google Presentation."""
-            service = get_service()
-            return await _reply_to_comment_impl(
-                service, app_name, presentation_id, comment_id, reply_content
-            )
-
-        async def resolve_comment(presentation_id: str, comment_id: str) -> str:
-            """Resolve a comment in a Google Presentation."""
-            service = get_service()
-            return await _resolve_comment_impl(
-                service, app_name, presentation_id, comment_id
-            )
-
     # Set the proper function names and register with server
     read_comments.__name__ = read_func_name
     create_comment.__name__ = create_func_name
@@ -183,7 +151,7 @@ async def _read_comments_impl(service, app_name: str, file_id: str) -> str:
     if not comments:
         return f"No comments found in {app_name} {file_id}"
 
-    output = [f"Found {len(comments)} comments in {app_name} {file_id}:\\n"]
+    output = [f"Found {len(comments)} comments in {app_name} {file_id}:\n"]
 
     for comment in comments:
         author = comment.get("author", {}).get("displayName", "Unknown")
@@ -214,7 +182,7 @@ async def _read_comments_impl(service, app_name: str, file_id: str) -> str:
 
         output.append("")  # Empty line between comments
 
-    return "\\n".join(output)
+    return "\n".join(output)
 
 
 async def _create_comment_impl(
@@ -239,7 +207,7 @@ async def _create_comment_impl(
     author = comment.get("author", {}).get("displayName", "Unknown")
     created = comment.get("createdTime", "")
 
-    return f"Comment created successfully!\\nComment ID: {comment_id}\\nAuthor: {author}\\nCreated: {created}\\nContent: {comment_content}"
+    return f"Comment created successfully!\nComment ID: {comment_id}\nAuthor: {author}\nCreated: {created}\nContent: {comment_content}"
 
 
 async def _reply_to_comment_impl(
@@ -267,7 +235,7 @@ async def _reply_to_comment_impl(
     author = reply.get("author", {}).get("displayName", "Unknown")
     created = reply.get("createdTime", "")
 
-    return f"Reply posted successfully!\\nReply ID: {reply_id}\\nAuthor: {author}\\nCreated: {created}\\nContent: {reply_content}"
+    return f"Reply posted successfully!\nReply ID: {reply_id}\nAuthor: {author}\nCreated: {created}\nContent: {reply_content}"
 
 
 async def _resolve_comment_impl(
@@ -295,4 +263,4 @@ async def _resolve_comment_impl(
     author = reply.get("author", {}).get("displayName", "Unknown")
     created = reply.get("createdTime", "")
 
-    return f"Comment {comment_id} has been resolved successfully.\\nResolve reply ID: {reply_id}\\nAuthor: {author}\\nCreated: {created}"
+    return f"Comment {comment_id} has been resolved successfully.\nResolve reply ID: {reply_id}\nAuthor: {author}\nCreated: {created}"

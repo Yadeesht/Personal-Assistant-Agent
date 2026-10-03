@@ -13,6 +13,7 @@ from pathlib import Path
 import copy
 from app_tools.core.server_init import content_server
 from app_tools.tools.google.workspace_comment_base import create_comment_tools
+from app_tools.tools.google.workspace_comment_base import get_service as drive_get_service
 from app_tools.helper.utils import UserInputError
 from app_tools.auth.service_decoder import get_google_service
 from app_tools.helper.pydantic_models import (
@@ -596,7 +597,8 @@ async def list_spreadsheets(
             status="error", message="", count=0, spreadsheets=[], error=error_msg
         ).model_dump_json(indent=2)
 
-    service = get_service()
+    # Listing files is a Drive call, not a Sheets one.
+    service = drive_get_service()
     logger.info("[list_spreadsheets] Invoked.")
 
     try:
@@ -727,23 +729,21 @@ async def get_spreadsheet_info(
                     )
                 )
 
-            sheets_section = (
-                "\n".join(sheets_info) if sheets_info else "  No sheets found"
-            )
-            message = "\n".join(
-                [
-                    f'Spreadsheet: "{title}" (ID: {request.spreadsheet_id}) | Locale: {locale}',
-                    f"Sheets ({len(sheets)}):",
-                    sheets_section,
-                ]
-            )
+        sheets_section = "\n".join(sheets_info) if sheets_info else "  No sheets found"
+        message = "\n".join(
+            [
+                f'Spreadsheet: "{title}" (ID: {request.spreadsheet_id}) | Locale: {locale}',
+                f"Sheets ({len(sheets)}):",
+                sheets_section,
+            ]
+        )
 
-            logger.info(
-                f"Successfully retrieved info for spreadsheet {request.spreadsheet_id}."
-            )
-            return GetSpreadsheetInfoResponse(
-                status="success", message=message
-            ).model_dump_json(indent=2)
+        logger.info(
+            f"Successfully retrieved info for spreadsheet {request.spreadsheet_id}."
+        )
+        return GetSpreadsheetInfoResponse(
+            status="success", message=message
+        ).model_dump_json(indent=2)
 
     except Exception as error:
         error_msg = f"Error getting spreadsheet info: {str(error)}"
@@ -1267,9 +1267,9 @@ async def add_conditional_formatting(
         new_rules_state = copy.deepcopy(current_rules)
         new_rules_state.insert(insert_at, new_rule)
 
-        add_rule_request = {"rule": new_rule}
-        if request.rule_index is not None:
-            add_rule_request["index"] = request.rule_index
+        # Always send the index: without it Google inserts at 0, while the
+        # state printed below (and the docstring) put the rule at insert_at.
+        add_rule_request = {"rule": new_rule, "index": insert_at}
 
         request_body = {"requests": [{"addConditionalFormatRule": add_rule_request}]}
 
@@ -1734,7 +1734,7 @@ async def create_spreadsheet(
 
         logger.info(f"Successfully created spreadsheet. ID: {spreadsheet_id}")
         return CreateSpreadsheetResponse(
-            status="success", message=message
+            status="success", message=message, spreadsheet_id=spreadsheet_id
         ).model_dump_json(indent=2)
 
     except Exception as error:

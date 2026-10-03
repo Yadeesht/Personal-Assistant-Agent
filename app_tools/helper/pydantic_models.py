@@ -214,7 +214,7 @@ class FilterIdRequest(BaseModel):
 class SearchEmailsRequest(BaseModel):
     """Search emails request"""
 
-    query: str = Field(..., min_length=1, description="Gmail search query")
+    query: str = Field(default="in:inbox", description="Gmail search query")
     max_results: Optional[int] = Field(None, ge=1, le=500, description="Max results")
 
 
@@ -295,119 +295,6 @@ class SearchByLabelResponse(BaseModel):
 
     count: int
     messages: List[dict]
-    error: Optional[str] = None
-
-
-# ============================Google Chat Models=========================
-
-
-class ListSpacesRequest(BaseModel):
-    """List Google Chat spaces request"""
-
-    page_size: int = Field(100, ge=1, le=1000, description="Max number of spaces")
-    space_type: str = Field(
-        "all",
-        description="Type of spaces: 'all', 'room', or 'dm'",
-        pattern="^(all|room|dm)$",
-    )
-
-
-class SpaceInfo(BaseModel):
-    """Google Chat space information"""
-
-    name: str
-    display_name: str
-    space_type: str
-
-
-class ListSpacesResponse(BaseModel):
-    """List spaces response"""
-
-    count: int
-    spaces: List[SpaceInfo]
-    space_type_filter: str
-    error: Optional[str] = None
-
-
-class GetMessagesRequest(BaseModel):
-    """Get messages from a space request"""
-
-    space_id: str = Field(..., min_length=1, description="Space ID (spaces/...)")
-    page_size: int = Field(50, ge=1, le=1000, description="Max number of messages")
-    order_by: str = Field(
-        "createTime desc",
-        description="Sort order for messages",
-        pattern="^createTime (asc|desc)$",
-    )
-
-
-class MessageInfo(BaseModel):
-    """Google Chat message information"""
-
-    name: str
-    sender: str
-    create_time: str
-    text: str
-
-
-class GetMessagesResponse(BaseModel):
-    """Get messages response"""
-
-    count: int
-    space_name: str
-    space_id: str
-    messages: List[MessageInfo]
-    error: Optional[str] = None
-
-
-class SendMessageRequest(BaseModel):
-    """Send message to a space request"""
-
-    space_id: str = Field(..., min_length=1, description="Space ID (spaces/...)")
-    message_text: str = Field(
-        ..., min_length=1, max_length=4096, description="Message text content"
-    )
-    thread_key: Optional[str] = Field(
-        None, description="Optional thread key for replies"
-    )
-
-
-class SendMessageResponse(BaseModel):
-    """Send message response"""
-
-    success: bool
-    message_id: Optional[str] = None
-    space_id: Optional[str] = None
-    thread_id: Optional[str] = None
-    error: Optional[str] = None
-
-
-class SearchMessagesRequest(BaseModel):
-    """Search messages request"""
-
-    query: str = Field(..., min_length=1, description="Search query text")
-    space_id: Optional[str] = Field(
-        None, description="Optional space ID to limit search"
-    )
-    page_size: int = Field(25, ge=1, le=100, description="Max results per space")
-
-
-class SearchMessageInfo(BaseModel):
-    """Search result message information"""
-
-    sender: str
-    create_time: str
-    text: str
-    space_name: str
-
-
-class SearchMessagesResponse(BaseModel):
-    """Search messages response"""
-
-    count: int
-    query: str
-    context: str
-    messages: List[SearchMessageInfo]
     error: Optional[str] = None
 
 
@@ -596,6 +483,7 @@ class GetTaskListResponse(BaseModel):
     """Get task list response"""
 
     status: str
+    message: str = ""
     task_list: Optional[TaskListInfo] = None
     error: Optional[str] = None
 
@@ -629,7 +517,7 @@ class UpdateTaskListResponse(BaseModel):
 
     status: str
     message: str
-    task_list_id: str
+    task_list_id: Optional[str] = None
     error: Optional[str] = None
 
 
@@ -731,7 +619,7 @@ class UpdateTaskResponse(BaseModel):
 
     status: str
     message: str
-    task_id: str
+    task_id: Optional[str] = None
     error: Optional[str] = None
 
 
@@ -781,102 +669,6 @@ class ClearCompletedTasksResponse(BaseModel):
 
     status: str
     message: str
-    error: Optional[str] = None
-
-
-# ========================= Google Slides Models =================================
-
-
-class CreatePresentationRequest(BaseModel):
-    """Create presentation request"""
-
-    title: str = Field(
-        "Untitled Presentation",
-        min_length=1,
-        max_length=255,
-        description="Presentation title",
-    )
-
-
-class CreatePresentationResponse(BaseModel):
-    """Create presentation response"""
-
-    status: str
-    message: str
-    presentation_id: Optional[str] = None
-    error: Optional[str] = None
-
-
-class GetPresentationRequest(BaseModel):
-    """Get presentation request"""
-
-    presentation_id: str = Field(..., min_length=1, description="Presentation ID")
-
-
-class GetPresentationResponse(BaseModel):
-    """Get presentation response"""
-
-    status: str
-    message: str
-    error: Optional[str] = None
-
-
-class BatchUpdateRequest(BaseModel):
-    """Batch update request item"""
-
-    # This is a flexible model that accepts any dict structure
-    # since Google Slides API accepts various request types
-    pass
-
-
-class BatchUpdatePresentationRequest(BaseModel):
-    """Batch update presentation request"""
-
-    presentation_id: str = Field(..., min_length=1, description="Presentation ID")
-    requests: List[dict] = Field(
-        ..., min_items=1, description="List of update requests"
-    )
-
-
-class BatchUpdatePresentationResponse(BaseModel):
-    """Batch update presentation response"""
-
-    status: str
-    message: str
-    error: Optional[str] = None
-
-
-class GetPageRequest(BaseModel):
-    """Get page request"""
-
-    presentation_id: str = Field(..., min_length=1, description="Presentation ID")
-    page_object_id: str = Field(..., min_length=1, description="Page object ID")
-
-
-class GetPageResponse(BaseModel):
-    """Get page response"""
-
-    status: str
-    message: str
-    error: Optional[str] = None
-
-
-class GetPageThumbnailRequest(BaseModel):
-    """Get page thumbnail request"""
-
-    presentation_id: str = Field(..., min_length=1, description="Presentation ID")
-    page_object_id: str = Field(..., min_length=1, description="Page object ID")
-    thumbnail_size: str = Field(
-        "MEDIUM", pattern="^(LARGE|MEDIUM|SMALL)$", description="Thumbnail size"
-    )
-
-
-class GetPageThumbnailResponse(BaseModel):
-    """Get page thumbnail response"""
-
-    status: str
-    message: str
-    thumbnail_url: Optional[str] = None
     error: Optional[str] = None
 
 
@@ -1092,237 +884,6 @@ class CreateSheetRequest(BaseModel):
 
 class CreateSheetResponse(BaseModel):
     """Create sheet response"""
-
-    status: str
-    message: str
-    error: Optional[str] = None
-
-
-# ========================= Google Forms Models =================================
-
-
-class CreateFormRequest(BaseModel):
-    """Create form request"""
-
-    title: str = Field(..., min_length=1, max_length=255, description="Form title")
-    description: Optional[str] = Field(
-        None, max_length=4096, description="Form description"
-    )
-    document_title: Optional[str] = Field(
-        None, max_length=255, description="Document title (browser tab)"
-    )
-
-
-class CreateFormResponse(BaseModel):
-    """Create form response"""
-
-    status: str
-    message: str
-    form_id: Optional[str] = None
-    edit_url: Optional[str] = None
-    responder_url: Optional[str] = None
-    error: Optional[str] = None
-
-
-class GetFormRequest(BaseModel):
-    """Get form request"""
-
-    user_google_email: str = Field(..., description="User's Google email")
-    form_id: str = Field(..., min_length=1, description="Form ID")
-
-
-class GetFormResponse(BaseModel):
-    """Get form response"""
-
-    status: str
-    message: str
-    error: Optional[str] = None
-
-
-class SetPublishSettingsRequest(BaseModel):
-    """Set publish settings request"""
-
-    form_id: str = Field(..., min_length=1, description="Form ID")
-    publish_as_template: bool = Field(False, description="Publish as template")
-    require_authentication: bool = Field(False, description="Require authentication")
-
-
-class SetPublishSettingsResponse(BaseModel):
-    """Set publish settings response"""
-
-    status: str
-    message: str
-    error: Optional[str] = None
-
-
-class GetFormResponseRequest(BaseModel):
-    """Get form response request"""
-
-    form_id: str = Field(..., min_length=1, description="Form ID")
-    response_id: str = Field(..., min_length=1, description="Response ID")
-
-
-class GetFormResponseResponse(BaseModel):
-    """Get form response response"""
-
-    status: str
-    message: str
-    error: Optional[str] = None
-
-
-class ListFormResponsesRequest(BaseModel):
-    """List form responses request"""
-
-    form_id: str = Field(..., min_length=1, description="Form ID")
-    page_size: int = Field(10, ge=1, le=100, description="Maximum number of responses")
-    page_token: Optional[str] = Field(None, description="Pagination token")
-
-
-class ListFormResponsesResponse(BaseModel):
-    """List form responses response"""
-
-    status: str
-    message: str
-    error: Optional[str] = None
-
-
-# ========================= Google Drive Models =================================
-
-
-class SearchDriveFilesRequest(BaseModel):
-    """Search Drive files request"""
-
-    query: str = Field(..., min_length=1, description="Search query string")
-    page_size: int = Field(10, ge=1, le=1000, description="Max number of files")
-    drive_id: Optional[str] = Field(None, description="Shared drive ID")
-    include_items_from_all_drives: bool = Field(
-        True, description="Include items from all drives"
-    )
-    corpora: Optional[str] = Field(
-        None,
-        description="Corpus to query (user, domain, drive, allDrives)",
-        pattern="^(user|domain|drive|allDrives)$",
-    )
-
-
-class SearchDriveFilesResponse(BaseModel):
-    """Search Drive files response"""
-
-    status: str
-    message: str
-    error: Optional[str] = None
-
-
-class GetDriveFileContentRequest(BaseModel):
-    """Get Drive file content request"""
-
-    file_id: str = Field(..., min_length=1, description="Drive file ID")
-
-
-class GetDriveFileContentResponse(BaseModel):
-    """Get Drive file content response"""
-
-    status: str
-    message: str
-    error: Optional[str] = None
-
-
-class ListDriveItemsRequest(BaseModel):
-    """List Drive items request"""
-
-    folder_id: str = Field("root", min_length=1, description="Folder ID")
-    page_size: int = Field(100, ge=1, le=1000, description="Max number of items")
-    drive_id: Optional[str] = Field(None, description="Shared drive ID")
-    include_items_from_all_drives: bool = Field(
-        True, description="Include items from all drives"
-    )
-    corpora: Optional[str] = Field(
-        None,
-        description="Corpus to query (user, domain, drive, allDrives)",
-        pattern="^(user|domain|drive|allDrives)$",
-    )
-
-
-class ListDriveItemsResponse(BaseModel):
-    """List Drive items response"""
-
-    status: str
-    message: str
-    error: Optional[str] = None
-
-
-class CreateDriveFileRequest(BaseModel):
-    """Create Drive file request"""
-
-    file_name: str = Field(..., min_length=1, max_length=255, description="File name")
-    content: Optional[str] = Field(None, description="File content")
-    folder_id: str = Field("root", min_length=1, description="Parent folder ID")
-    mime_type: str = Field("text/plain", description="MIME type")
-    fileUrl: Optional[str] = Field(None, description="URL to fetch content from")
-
-
-class CreateDriveFileResponse(BaseModel):
-    """Create Drive file response"""
-
-    status: str
-    message: str
-    file_id: Optional[str] = None
-    link: Optional[str] = None
-    error: Optional[str] = None
-
-
-class GetDriveFilePermissionsRequest(BaseModel):
-    """Get Drive file permissions request"""
-
-    file_id: str = Field(..., min_length=1, description="Drive file ID")
-
-
-class GetDriveFilePermissionsResponse(BaseModel):
-    """Get Drive file permissions response"""
-
-    status: str
-    message: str
-    error: Optional[str] = None
-
-
-class CheckDriveFilePublicAccessRequest(BaseModel):
-    """Check Drive file public access request"""
-
-    file_name: str = Field(..., min_length=1, description="File name to check")
-
-
-class CheckDriveFilePublicAccessResponse(BaseModel):
-    """Check Drive file public access response"""
-
-    status: str
-    message: str
-    error: Optional[str] = None
-
-
-class UpdateDriveFileRequest(BaseModel):
-    """Update Drive file request"""
-
-    file_id: str = Field(..., min_length=1, description="Drive file ID")
-    name: Optional[str] = Field(None, max_length=255, description="New file name")
-    description: Optional[str] = Field(None, description="File description")
-    mime_type: Optional[str] = Field(None, description="MIME type")
-    add_parents: Optional[str] = Field(
-        None, description="Parent IDs to add (comma-separated)"
-    )
-    remove_parents: Optional[str] = Field(
-        None, description="Parent IDs to remove (comma-separated)"
-    )
-    starred: Optional[bool] = Field(None, description="Star status")
-    trashed: Optional[bool] = Field(None, description="Trash status")
-    writers_can_share: Optional[bool] = Field(None, description="Writers can share")
-    copy_requires_writer_permission: Optional[bool] = Field(
-        None, description="Copy requires writer permission"
-    )
-    properties: Optional[dict] = Field(None, description="Custom properties")
-
-
-class UpdateDriveFileResponse(BaseModel):
-    """Update Drive file response"""
 
     status: str
     message: str

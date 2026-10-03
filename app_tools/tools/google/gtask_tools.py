@@ -326,7 +326,7 @@ async def update_task_list(task_list_id: str, title: str) -> str:
             f"Updated task list {request.task_list_id} with new title '{request.title}'"
         )
         return UpdateTaskListResponse(
-            status="success", message=message
+            status="success", message=message, task_list_id=request.task_list_id
         ).model_dump_json(indent=2)
 
     except HttpError as error:
@@ -524,13 +524,15 @@ async def list_tasks(
         return response
 
     except HttpError as error:
-        message = f"API error: {error}. You might need to re-authenticate. LLM: Try 'start_google_auth' with the user's and service_name='Google Tasks'."
+        # Report like the other task tools instead of raising, and don't point
+        # the model at an auth tool that doesn't exist.
+        message = f"API error: {error}"
         logger.error(message, exc_info=True)
-        raise Exception(message)
+        return message
     except Exception as e:
         message = f"Unexpected error: {e}."
         logger.exception(message)
-        raise Exception(message)
+        return message
 
 
 def get_structured_tasks(tasks: List[Dict[str, str]]) -> List[StructuredTask]:
@@ -906,9 +908,9 @@ async def update_task(
             message += f"\n- Completed: {result.get('completed')}"
 
         logger.info(f"Updated task {request.task_id}")
-        return UpdateTaskResponse(status="success", message=message).model_dump_json(
-            indent=2
-        )
+        return UpdateTaskResponse(
+            status="success", message=message, task_id=request.task_id
+        ).model_dump_json(indent=2)
 
     except HttpError as error:
         error_msg = f"API error: {error}"

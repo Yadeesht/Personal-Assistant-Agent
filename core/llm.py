@@ -21,8 +21,8 @@ def _build_llm(model: str = None):
     )
 
 
-def build_llm_with_tools(tools, model: str = None):
-    return _build_llm(model).bind_tools(tools)
+def build_llm_with_tools(tools, model: str = None, **bind_kwargs):
+    return _build_llm(model).bind_tools(tools, **bind_kwargs)
 
 
 def build_llm(model: str = None):

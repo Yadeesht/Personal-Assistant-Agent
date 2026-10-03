@@ -34,11 +34,6 @@ SCOPES = {
         "https://www.googleapis.com/auth/calendar.readonly",
         "https://www.googleapis.com/auth/calendar.events",
     ],
-    "gchat": [
-        "https://www.googleapis.com/auth/chat.messages.readonly",
-        "https://www.googleapis.com/auth/chat.messages",
-        "https://www.googleapis.com/auth/chat.spaces",
-    ],
     "gdrive": [
         "https://www.googleapis.com/auth/drive",
         "https://www.googleapis.com/auth/drive.file",
@@ -47,17 +42,9 @@ SCOPES = {
         "https://www.googleapis.com/auth/tasks",
         "https://www.googleapis.com/auth/tasks.readonly",
     ],
-    "slides": [
-        "https://www.googleapis.com/auth/presentations",
-        "https://www.googleapis.com/auth/presentations.readonly",
-    ],
     "sheets": [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/spreadsheets.readonly",
-    ],
-    "forms": [
-        "https://www.googleapis.com/auth/forms.body",
-        "https://www.googleapis.com/auth/forms.responses.readonly",
     ],
     "docs": [
         "https://www.googleapis.com/auth/documents",
@@ -116,27 +103,6 @@ def get_google_service(
 
     thread_cache = _get_thread_service_cache()
 
-    # Custom Search uses API key, not OAuth
-    if service_type == "customsearch":
-        cache_key = "customsearch_api_key"
-        if not force_refresh and cache_key in thread_cache:
-            logger.info(f"Returning cached service for {cache_key}")
-            return thread_cache[cache_key]
-
-        api_key = os.environ.get("GOOGLE_PSE_API_KEY")
-        if not api_key:
-            raise ValueError(
-                "GOOGLE_PSE_API_KEY environment variable not set. "
-                "Get your API key from https://console.cloud.google.com/apis/credentials"
-            )
-
-        logger.info("Building Custom Search service with API key")
-        service = build("customsearch", "v1", developerKey=api_key)
-        thread_cache[cache_key] = service
-        _service_cache[cache_key] = service
-        logger.info("Custom Search service created and cached successfully")
-        return service
-
     cache_key = f"{service_type}_{scope_key}"
     if not force_refresh and cache_key in thread_cache:
         logger.info(f"Returning cached service for {cache_key}")
@@ -175,11 +141,11 @@ def get_google_service(
             with open(token_path, "w") as token:
                 token.write(creds.to_json())
 
-    api_name_overrides = {"gchat": "chat", "gdrive": "drive"}
+    api_name_overrides = {"gdrive": "drive"}
     api_service_name = api_name_overrides.get(service_type, service_type)
     version = (
         "v1"
-        if service_type in ["gmail", "gchat", "tasks", "slides", "forms", "docs"]
+        if service_type in ["gmail", "tasks", "docs"]
         else "v4"
         if service_type in ["sheets"]
         else "v3"

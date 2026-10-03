@@ -153,6 +153,8 @@ class ValidationManager:
         underline: Optional[bool] = None,
         font_size: Optional[int] = None,
         font_family: Optional[str] = None,
+        text_color: Optional[Any] = None,
+        background_color: Optional[Any] = None,
     ) -> Tuple[bool, str]:
         """
         Validate text formatting parameters.
@@ -163,16 +165,26 @@ class ValidationManager:
             underline: Underline setting
             font_size: Font size in points
             font_family: Font family name
+            text_color: Text color (hex string); parsed by the request builder
+            background_color: Highlight color (hex string); parsed by the request builder
 
         Returns:
             Tuple of (is_valid, error_message)
         """
         # Check if at least one formatting option is provided
-        formatting_params = [bold, italic, underline, font_size, font_family]
+        formatting_params = [
+            bold,
+            italic,
+            underline,
+            font_size,
+            font_family,
+            text_color,
+            background_color,
+        ]
         if all(param is None for param in formatting_params):
             return (
                 False,
-                "At least one formatting parameter must be provided (bold, italic, underline, font_size, or font_family)",
+                "At least one formatting parameter must be provided (bold, italic, underline, font_size, font_family, text_color, or background_color)",
             )
 
         # Validate boolean parameters

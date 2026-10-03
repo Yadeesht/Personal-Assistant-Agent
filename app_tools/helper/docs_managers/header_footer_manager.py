@@ -75,10 +75,21 @@ class HeaderFooterManager:
             )
 
             if not target_section:
-                return (
-                    False,
-                    f"No {section_type} found in document. Please create a {section_type} first in Google Docs.",
+                # No such section yet: create it, then look it up again.
+                created, create_message = await self.create_header_footer(
+                    document_id, section_type, header_footer_type
                 )
+                if not created:
+                    return False, create_message
+                doc = await self._get_document(document_id)
+                target_section, section_id = await self._find_target_section(
+                    doc, section_type, header_footer_type
+                )
+                if not target_section:
+                    return (
+                        False,
+                        f"Created a {section_type} but could not find it to update.",
+                    )
 
             # Update the content
             success = await self._replace_section_content(
@@ -180,15 +191,21 @@ class HeaderFooterManager:
         start_index = first_para.get("startIndex", 0)
         end_index = first_para.get("endIndex", 0)
 
+        # Header/footer text lives in its own segment; without the ID the
+        # edits would target the document body.
+        segment_id = section.get("headerId") or section.get("footerId")
+
         # Build requests to replace content
         requests = []
 
-        # Delete existing content if any (preserve paragraph structure)
-        if end_index > start_index:
+        # Delete existing content if any (preserve paragraph structure).
+        # A fresh section holds only the paragraph end marker: nothing to delete.
+        if end_index - 1 > start_index:
             requests.append(
                 {
                     "deleteContentRange": {
                         "range": {
+                            "segmentId": segment_id,
                             "startIndex": start_index,
                             "endIndex": end_index - 1,  # Keep the paragraph end marker
                         }
@@ -198,7 +215,12 @@ class HeaderFooterManager:
 
         # Insert new content
         requests.append(
-            {"insertText": {"location": {"index": start_index}, "text": new_content}}
+            {
+                "insertText": {
+                    "location": {"segmentId": segment_id, "index": start_index},
+                    "text": new_content,
+                }
+            }
         )
 
         try:
