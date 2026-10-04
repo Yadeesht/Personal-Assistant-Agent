@@ -1,23 +1,32 @@
+import asyncio
 import json
+import time
+from datetime import datetime
 
+import aiosqlite
 import httpx
 from langchain_core.messages import (
     AIMessage,
     RemoveMessage,
     SystemMessage,
     ToolMessage,
+    trim_messages,
 )
 
 from config.prompts import HISTORY_SUMMARIZE_PROMPT
+from config.settings import DEFAULT_THREAD_ID, MEMORY_DB
+from core.codeagent import CodeExecutionAgent
 from core.llm import build_llm
 from core.state import State
+from rag.episodic_rag import EpisodicRAG
 from utils.helper import (
     count_tokens,
+    format_tool_to_text,
     get_current_time,
     request_counter,
-    sanitize_history,
     setup_logger,
 )
+from utils.memory_manager import log_event, sanitize_history
 from langgraph.types import Command
 import langchain_core.tools.base
 from langchain_core.tools import tool, InjectedToolCallId
@@ -96,7 +105,9 @@ AGENT_MESSAGE_KEY = {
     "communication_agent": "communication_messages",
     "planning_agent": "planning_messages",
     "document_agent": "document_messages",
+    "presentation_agent": "presentation_messages",
     "data_agent": "data_messages",
+    "code_agent": "code_messages",
 }
 
 
@@ -125,9 +136,14 @@ def supervisor_node_factory(
         scoped_messages = _resolve_agent_messages(state, agent_name)
         logger.info(f"📨 Messages in supervisor context: {len(scoped_messages)}")
 
-        # No token cap: the supervisor sees its whole history. Long threads are condensed
-        # between turns by the summarizer (route_start), not trimmed here.
-        last_messages = list(scoped_messages)
+        last_messages = trim_messages(
+            scoped_messages,
+            max_tokens=30000,
+            strategy="last",
+            token_counter=count_tokens,
+            include_system=True,
+            start_on="human",
+        )
 
         logger.info("=" * 80)
         if last_messages:  # this is for logs purpose only
@@ -219,6 +235,25 @@ def supervisor_node_factory(
             additional_kwargs={"timestamp": current_time},
         )
 
+        try:
+            has_tools = bool(getattr(response, "tool_calls", []))
+            if has_tools:
+                await log_event(
+                    thread_id=DEFAULT_THREAD_ID,
+                    actor=agent_name,
+                    message=f"{', '.join([format_tool_to_text(tc.get('name', ''), json.dumps(tc.get('args', {}))) for tc in response.tool_calls])}",
+                    metadata={"request_num": request_num, "type": "tool_call"},
+                )
+            elif response.content:
+                await log_event(
+                    thread_id=DEFAULT_THREAD_ID,
+                    actor=agent_name,
+                    message=f"Direct response: {response.content[:500]}",
+                    metadata={"request_num": request_num, "type": "content"},
+                )
+        except Exception as e:
+            logger.error(f"Failed to log supervisor event: {e}")
+
         return {
             "messages": [agent_message],
             "supervisor_messages": [agent_message],
@@ -249,17 +284,22 @@ def agent_node_factory(llm_with_tools, system_prompt, agent_name: str):
         logger.info(f"🔄 {current_agent_name.upper()} REQUEST #{request_num}")
         logger.info("=" * 80)
 
-        # No token cap: a worker sees its whole task history (a token cap starting on the
-        # handoff message emptied the context once tool results passed the cap).
         scoped_messages = _resolve_agent_messages(state, current_agent_name)
-        last_messages = list(scoped_messages)
+        last_messages = trim_messages(
+            scoped_messages,
+            max_tokens=10000,
+            strategy="last",
+            token_counter=count_tokens,
+            include_system=True,
+            start_on="human",
+        )
 
         logger.info(f"📨 Messages in conversation: {len(last_messages)}")
 
         logger.info("=" * 80)
         if last_messages:
             content_preview = sanitize_history(last_messages)
-            content_preview = json.dumps(content_preview[-5:], indent=2)
+            content_preview = json.dumps(content_preview, indent=2)
             logger.info(f"📝 Content preview: {content_preview}")
 
         logger.info("=" * 80)
@@ -329,16 +369,174 @@ def agent_node_factory(llm_with_tools, system_prompt, agent_name: str):
             tool_calls=getattr(msg, "tool_calls", []),
             additional_kwargs={"timestamp": current_time},
         )
+        try:
+            has_tools = bool(getattr(msg, "tool_calls", []))
+            if final_content and not has_tools:
+                await log_event(
+                    thread_id=DEFAULT_THREAD_ID,
+                    actor=current_agent_name,
+                    message=final_content,
+                    metadata={
+                        "request_num": request_num,
+                        "type": "content",
+                    },
+                )
+
+            if has_tools:
+                await log_event(
+                    thread_id=DEFAULT_THREAD_ID,
+                    actor=current_agent_name,
+                    message=f"{', '.join([format_tool_to_text(tc.get('name', ''), json.dumps(tc.get('args', {}))) for tc in msg.tool_calls])}",
+                    metadata={"type": "tool_call"},
+                )
+        except Exception as e:
+            logger.error(f"Failed to log audit event: {e}")
 
         message_key = AGENT_MESSAGE_KEY.get(current_agent_name, "messages")
-        update = {
+        return {
             "messages": [agent_message],
             message_key: [agent_message],
             "current_agent": current_agent_name,
         }
-        return update
 
     return agent_node
+
+
+def code_execution_factory(llm, tool_sets, agent_name: str):
+    """Create the code execution node that runs CodeExecutionAgent workflows with user permission checks and local Port 9000 sandbox."""
+
+    async def code_executor(state: State):
+        """Execute one code-agent turn and return code or execution output depending on approval state."""
+        import re
+        current_time = get_current_time()
+        current_agent_name = agent_name
+
+        scoped_messages = _resolve_agent_messages(state, current_agent_name)
+        
+        # Check if the user is approving a previously generated code block
+        is_approved = False
+        code_to_run = None
+        
+        last_msg = scoped_messages[-1] if scoped_messages else None
+        if last_msg and last_msg.type == "human":
+            content_lower = (last_msg.content or "").strip().lower()
+            if content_lower in ["approve", "yes", "run", "ok", "run it"]:
+                # Traverse backward to find the last AI message with python code
+                for msg in reversed(scoped_messages):
+                    if msg.type == "ai" and "```python" in msg.content:
+                        match = re.search(r"```python\n(.*?)\n```", msg.content, re.DOTALL)
+                        if match:
+                            code_to_run = match.group(1)
+                            is_approved = True
+                            break
+
+        if is_approved and code_to_run:
+            logger.info("Code execution approved by user! Running...")
+            try:
+                agent = CodeExecutionAgent(llm, tool_sets)
+                # Parse intent from prior messages (exclude the latest 'approve' human message)
+                task_spec = await agent._resolve_intent(scoped_messages[:-1])
+                tool_map = agent._create_tool_map(task_spec.required_tools_hint)
+                
+                # Execute in the sacrificial Python sandbox server
+                msg = await agent._execute_in_sandbox(code_to_run, tool_map)
+                
+                if msg.get("status") == "success":
+                    summary = msg.get("summary", "Code executed successfully.")
+                    full_output = json.dumps(msg.get("full_output", {}), indent=2)
+                    
+                    await log_event(
+                        thread_id=DEFAULT_THREAD_ID,
+                        actor="code_agent",
+                        message=f"PLAN: {task_spec.primary_goal}\n\nEXECUTED CODE:\n```python\n{code_to_run}\n```",
+                        metadata={"type": "code_execution"}
+                    )
+                    await log_event(
+                        thread_id=DEFAULT_THREAD_ID,
+                        actor="code_agent",
+                        message=f"EXECUTION RESULT:\nStatus: success\nSummary: {summary}\nDetails: {full_output}",
+                        metadata={"type": "code_output", "status": "success"}
+                    )
+                    
+                    response_text = f"Code execution completed successfully.\n\n**Summary**:\n{summary}\n\n**Output details**:\n```json\n{full_output}\n```"
+                else:
+                    error_msg = msg.get("error", "Unknown sandbox error")
+                    response_text = f"Code execution failed with error:\n\n```\n{error_msg}\n```"
+                    
+                agent_message = AIMessage(
+                    content=response_text,
+                    name=current_agent_name,
+                    additional_kwargs={"timestamp": current_time}
+                )
+                
+                return {
+                    "messages": [agent_message],
+                    "code_messages": [agent_message],
+                    "current_agent": "supervisor" # Handoff back to supervisor
+                }
+            except Exception as e:
+                logger.error(f"Error running approved code: {e}")
+                err_msg = AIMessage(content=f"Error executing code: {str(e)}", name=current_agent_name)
+                return {
+                    "messages": [err_msg],
+                    "code_messages": [err_msg],
+                    "current_agent": "supervisor"
+                }
+        else:
+            # Generate the Python code first and request user approval
+            logger.info("Generating code and requesting user approval...")
+            try:
+                agent = CodeExecutionAgent(llm, tool_sets)
+                last_messages = trim_messages(
+                    scoped_messages,
+                    max_tokens=30000,
+                    strategy="last",
+                    token_counter=count_tokens,
+                    include_system=True,
+                    start_on="human",
+                )
+                task_spec = await agent._resolve_intent(last_messages)
+                
+                if not task_spec.required_tools_hint and not task_spec.primary_goal:
+                    err_msg = AIMessage(content="Could not parse intent for code execution.", name=current_agent_name)
+                    return {
+                        "messages": [err_msg],
+                        "code_messages": [err_msg],
+                        "current_agent": "supervisor"
+                    }
+                    
+                tool_schemas = await agent._load_tool_schemas(task_spec.required_tools_hint)
+                code_prompt = agent._build_code_generation_prompt(task_spec, tool_schemas)
+                generated_code = await agent._generate_code(code_prompt)
+                
+                approval_request = (
+                    f"I have generated the following Python code to address your request:\n\n"
+                    f"```python\n{generated_code}\n```\n\n"
+                    f"**Please review the code and reply with 'approve' to execute it.**"
+                )
+                
+                agent_message = AIMessage(
+                    content=approval_request,
+                    name=current_agent_name,
+                    additional_kwargs={"timestamp": current_time}
+                )
+                
+                return {
+                    "messages": [agent_message],
+                    "code_messages": [agent_message],
+                    "current_agent": current_agent_name # Retain context so the approval is routed directly back
+                }
+            except Exception as e:
+                logger.error(f"Error generating code: {e}")
+                err_msg = AIMessage(content=f"Error generating code: {str(e)}", name=current_agent_name)
+                return {
+                    "messages": [err_msg],
+                    "code_messages": [err_msg],
+                    "current_agent": "supervisor"
+                }
+
+    return code_executor
+
 
 
 async def summerizer_node(state: State):
@@ -395,7 +593,20 @@ async def summerizer_node(state: State):
             f"⚠️ Found {missing_ids_count} messages without IDs that cannot be removed."
         )
 
-    updates ={"summary": summarized_content, "messages": delete_actions}
+    try:
+        await log_event(
+            thread_id=DEFAULT_THREAD_ID,
+            actor="summerizer_node",
+            message=f"summerized content: {summarized_content}",
+            metadata={
+                "archived_messages": len(delete_actions),
+                "unremovable_messages": missing_ids_count,
+            },
+        )
+    except Exception as e:
+        logger.error(f"Failed to log summarizer audit event: {e}")
+
+    updates = {"summary": summarized_content, "messages": delete_actions}
 
     # The global "messages" channel doesn't mirror every scoped-agent
     # message 1:1 (e.g. supervisor handoff seeds only live in the scoped
@@ -419,43 +630,190 @@ async def summerizer_node(state: State):
     return updates
 
 
-# What a worker starts with: the user's own words, never a paraphrase, plus a fixed instruction.
-WORKER_HANDOFF_TEMPLATE = (
-    "[Handoff from supervisor]\n"
-    "User request (the user's exact words):\n{request}\n"
-    "{context}"
-    "\nDo the part of this request that your tools cover. When you are done, call "
-    "`work_completion` with the result; if part of the request needs another app, say what is left."
-)
+def memory_node_factory():
+    """Create the memory maintenance node.
 
-# A look-up for another worker: find information only, so nothing is done out of order
-# (e.g. emailing a schedule before the meetings are booked).
-WORKER_LOOKUP_TEMPLATE = (
-    "[Look-up request from supervisor]\n"
-    "User request (the user's exact words, for background only; other agents handle the rest of it):\n{request}\n"
-    "{context}"
-    "\nFind and return only this: {lookup}\n"
-    "Use your tools to look it up. Do not create, change, send or delete anything in this handoff. "
-    "When you are done, call `work_completion` with what you found (the actual names, addresses, dates, "
-    "IDs or text), or say plainly that it is not in your app."
-)
+    The returned node updates long-term memory systems (knowledge graph and
+    episodic RAG) and refreshes memory-related timestamps in graph state.
+    """
+
+    async def memory_node(state: State):
+        """Run memory update pipelines and return state update fields."""
+        from config.settings import DEFAULT_THREAD_ID, MEMORY_DB
+        from core.agent import updation_episodic_rag, updation_knowledge_graph
+
+        now_float = time.time()
+
+        updates = {}
+
+        await updation_knowledge_graph(
+            state=state, thread_id=DEFAULT_THREAD_ID, db_path=MEMORY_DB
+        )
+
+        await updation_episodic_rag(
+            past_summary_date=state.get("last_memory_timestamp", 0.0), db_path=MEMORY_DB
+        )
+
+        updates["last_knowledgegraph_timestamp"] = now_float
+
+        updates["last_memory_timestamp"] = now_float
+        return updates
+
+    return memory_node
 
 
-def _latest_user_request(state: dict) -> str:
-    """The user's latest message, verbatim (user messages are the unnamed HumanMessages)."""
-    for m in reversed(state.get("messages", [])):
-        if isinstance(m, HumanMessage) and not m.name:
-            return m.content if isinstance(m.content, str) else str(m.content)
-    return ""
+async def updation_episodic_rag(past_summary_date=None, db_path=MEMORY_DB):
+    """Update episodic RAG index from memory logs after a given timestamp."""
+    try:
+        logger.info("🔄 Starting episodic RAG update process.")
+
+        if past_summary_date is None or past_summary_date == 0.0:
+            past_summary_date = None
+            logger.info("No previous timestamp found, fetching all available logs")
+
+        if past_summary_date is not None:
+            if isinstance(past_summary_date, float):
+                past_summary_date_iso = datetime.fromtimestamp(
+                    past_summary_date
+                ).isoformat()
+            elif isinstance(past_summary_date, datetime):
+                past_summary_date_iso = past_summary_date.isoformat()
+            else:
+                past_summary_date_iso = str(past_summary_date)
+
+            logger.info(f"Fetching logs after: {past_summary_date_iso}")
+        else:
+            logger.info("Fetching ALL logs from database")
+
+        rag = EpisodicRAG(db_path=db_path)
+        chunks = await rag.custom_text_splitters(past_summary_date=past_summary_date)
+
+        if not chunks:
+            logger.info("No chunks generated - no new data to index.")
+            return
+
+        rag.index_creation(chunks)
+        logger.info("✅ Episodic RAG update process completed successfully.")
+    except Exception as e:
+        logger.error(f"Episodic RAG update failed: {e}")
+
+
+async def updation_knowledge_graph(
+    state: State, thread_id: str, db_path: str = MEMORY_DB
+):
+    """Extract new facts from logs and apply create/update ops to knowledge graph."""
+    try:
+        # Reuse the shared singleton (app_tools.tools.rag_tools) instead of
+        # opening a second kuzu.Database on the same path — kuzu does not
+        # support multiple concurrent connections to one database file from
+        # the same process.
+        from app_tools.tools.rag_tools import get_kg_instance
+
+        logger.info("🔄 Starting knowledge graph update process.")
+        last_update = state.get("last_knowledgegraph_timestamp", 0.0)
+
+        if isinstance(last_update, float):
+            last_update_str = datetime.fromtimestamp(last_update).isoformat()
+
+        elif isinstance(last_update, datetime):
+            last_update_str = last_update.isoformat()
+
+        else:
+            last_update_str = str(last_update)
+
+        query = """
+            SELECT actor, message
+            FROM human_logs
+            WHERE thread_id = ?
+            AND actor IN (?,?)
+            AND timestamp > ?
+            AND COALESCE(json_extract(metadata, '$.type'), '') != 'tool_call'
+            ORDER BY timestamp ASC;
+        """
+
+        target_actors = ("Human_node", "supervisor")
+
+        async with aiosqlite.connect(db_path) as db:
+            async with db.execute(
+                query, (thread_id, *target_actors, last_update_str)
+            ) as cursor:
+                rows = await cursor.fetchall()
+                logger.info(f"🔎 Found {len(rows)} new log entries in DB.")
+
+        if not rows:
+            logger.info("↩️ No new logs found since last update. Exiting.")  # NEW LOG
+            return
+
+        extraction_context = "\n".join([f"{actor}: {msg}" for actor, msg in rows])
+        kg = get_kg_instance()
+        candidates_json = kg.generate_entity_relation(extraction_context)
+
+        logger.info(
+            f"Extracted candidates for KG update: {json.dumps(candidates_json, indent=2)}"
+        )
+
+        if not candidates_json.get("candidates", {}).get(
+            "entities"
+        ) and not candidates_json.get("candidates", {}).get("relationships"):
+            logger.info(
+                "🔍 No valid entities or relationships found. Exiting update process."
+            )
+            return
+        entities = candidates_json.get("candidates", {}).get("entities", [])
+
+        types_df = kg.search_similar_node(entities)
+
+        final_update_json = kg.validate_entity_relation(types_df, candidates_json)
+        resolution = final_update_json.get("resolution", {})
+
+        logger.info(
+            f"The validated KG update resolution: {json.dumps(resolution, indent=2)}"
+        )
+        for entity in resolution.get("entities", []):
+            action = entity.get("action", "DISCARD").upper()
+
+            if action == "CREATE":
+                kg.add_entity(
+                    node_id=entity["id"],
+                    node_type=entity.get("type", "unknown"),
+                    search_keywords=", ".join(entity.get("search_keywords", [])),
+                    description=entity.get("description", ""),
+                )
+            elif action == "UPDATE":
+                kg.add_entity(
+                    node_id=entity.get("id"),
+                    node_type=entity.get("type") or "unknown",
+                    search_keywords=", ".join(entity.get("search_keywords", [])),
+                    description=entity.get("description") or "",
+                )
+
+        for rel in resolution.get("relationships", []):
+            action = rel.get("action", "DISCARD").upper()
+
+            if action == "CREATE":
+                kg.add_relationship(
+                    source=rel["source"],
+                    target=rel["target"],
+                    relation_type=rel.get("relation_type", "unknown"),
+                )
+            elif action == "UPDATE":
+                kg.modify_relationship(
+                    source=rel["source"],
+                    target=rel["target"],
+                    relation_type=rel.get("relation_type", "unknown"),
+                )
+        logger.info("✅ Knowledge graph update process completed successfully.")
+        kg.visualize()
+
+    except Exception as e:
+        logger.error(f"Knowledge graph update failed: {e}")
 
 
 @tool
 def route_to_agent(
-    state: Annotated[dict, InjectedState],
     tool_call_id: Annotated[str, InjectedToolCallId],
     agent: str,
-    context: str = "",
-    lookup: str = "",
+    message: str,
 ) -> Command:
     """
     Route the conversation to the correct specialized agent.
@@ -464,38 +822,64 @@ def route_to_agent(
     yourself. The moment you identify the user's intent, route immediately.
 
     AGENT DOMAINS:
-    - communication_agent: Gmail, sending emails, checking email.
+    - communication_agent: Gmail, sending emails, checking email, messaging.
     - planning_agent: Google Calendar, Google Tasks, creating meetings, scheduling.
-    - document_agent: Google Docs, document creation, document lookup.
-    - data_agent: Google Sheets, spreadsheets, tables.
+    - document_agent: Google Drive, Google Docs, document creation, drive lookup.
+    - data_agent: Google Sheets, Google Forms, spreadsheets, tables.
+    - presentation_agent: Google Slides, presentations.
+    - code_agent: Executing Python code, complex computations, data science sandboxing.
 
-    The worker automatically receives the user's latest message word for word.
-
-    context: Optional. Only facts the worker cannot find itself: results from earlier
-      workers (names, addresses, dates, IDs, text) or what the user said in earlier turns.
-      Leave it empty on a first handoff. Never rephrase the request or add instructions.
-    lookup: Optional. Set it only to ask this worker to FIND information another worker
-      needs (e.g. "the names and email addresses of Yadeesh's direct reports"). The worker
-      then only looks it up and changes nothing. Leave it empty for a normal handoff.
+    message: The seed context the worker agent will start with. Describe clearly
+      what the user is asking and provide any relevant parameters already extracted.
     """
+    if agent == "code_agent":
+        import json
+        from pathlib import Path
+        enabled_tools_file = Path(__file__).resolve().parent.parent / "data" / "enabled_tools.json"
+        is_enabled = True
+        if enabled_tools_file.exists():
+            try:
+                with open(enabled_tools_file, "r") as f:
+                    config = json.load(f)
+                    is_enabled = config.get("code_agent", True)
+            except Exception:
+                pass
+                
+        if not is_enabled:
+            logger.warning("Attempted to route to code_agent but it is disabled by user.")
+            return Command(
+                update={
+                    "supervisor_messages": [
+                        ToolMessage(
+                            content="Error: code_agent is currently disabled by user settings. Please perform the task using other agents (e.g. data_agent, document_agent) or explain directly.",
+                            tool_call_id=tool_call_id,
+                        )
+                    ],
+                    "messages": [
+                        ToolMessage(
+                            content="Error: code_agent is currently disabled by user settings.",
+                            tool_call_id=tool_call_id,
+                        )
+                    ],
+                    "current_agent": "supervisor",
+                }
+            )
     supervisor_closure = ToolMessage(
         content=f"Successfully routed user to {agent}.",
         tool_call_id=tool_call_id,
     )
 
-    context_block = f"\nContext from earlier steps:\n{context.strip()}\n" if context and context.strip() else ""
-    request = _latest_user_request(state)
-    if lookup and lookup.strip():
-        seed_text = WORKER_LOOKUP_TEMPLATE.format(request=request, context=context_block, lookup=lookup.strip())
-    else:
-        seed_text = WORKER_HANDOFF_TEMPLATE.format(request=request, context=context_block)
-    worker_seed = HumanMessage(content=seed_text, name="supervisor")
+    worker_seed = HumanMessage(
+        content=f"[Supervisor Handoff]: {message}", name="supervisor"
+    )
 
     agent_key_map = {
         "communication_agent": "communication_messages",
         "planning_agent": "planning_messages",
         "document_agent": "document_messages",
+        "presentation_agent": "presentation_messages",
         "data_agent": "data_messages",
+        "code_agent": "code_messages",
     }
     store_msg = agent_key_map.get(agent, "messages")
 
@@ -533,7 +917,9 @@ def work_completion(
         "communication_agent": "communication_messages",
         "planning_agent": "planning_messages",
         "document_agent": "document_messages",
+        "presentation_agent": "presentation_messages",
         "data_agent": "data_messages",
+        "code_agent": "code_messages",
     }
 
     store_msg = agent_key_map.get(current_agent, "messages")

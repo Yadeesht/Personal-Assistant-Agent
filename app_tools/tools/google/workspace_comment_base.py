@@ -2,7 +2,7 @@
 Core Comments Module
 
 This module provides reusable comment management functions for Google Workspace applications.
-Google Docs and Sheets both use the Drive API for comment operations.
+Google Docs, Sheets and Slides all use the Drive API for comment operations.
 """
 
 import asyncio
@@ -35,8 +35,8 @@ def create_comment_tools(app_name: str, file_id_param: str):
     Factory function to create comment management tools for a specific Google Workspace app.
 
     Args:
-        app_name: Name of the app ("document" or "spreadsheet")
-        file_id_param: Parameter name for the file ID ("document_id" or "spreadsheet_id")
+        app_name: Name of the app ("document", "spreadsheet" or "presentation")
+        file_id_param: Parameter name for the file ID ("document_id", "spreadsheet_id" or "presentation_id")
 
     Returns:
         Dict containing the four comment management functions with unique names
@@ -111,6 +111,38 @@ def create_comment_tools(app_name: str, file_id_param: str):
             service = get_service()
             return await _resolve_comment_impl(
                 service, app_name, spreadsheet_id, comment_id
+            )
+
+    elif file_id_param == "presentation_id":
+
+        async def read_comments(presentation_id: str) -> str:
+            """Read all comments from a Google Presentation."""
+            service = get_service()
+            return await _read_comments_impl(service, app_name, presentation_id)
+
+        async def create_comment(presentation_id: str, comment_content: str) -> str:
+            """Create a new comment on a Google Presentation."""
+            service = get_service()
+            return await _create_comment_impl(
+                service, app_name, presentation_id, comment_content
+            )
+
+        async def reply_to_comment(
+            presentation_id: str,
+            comment_id: str,
+            reply_content: str,
+        ) -> str:
+            """Reply to a specific comment in a Google Presentation."""
+            service = get_service()
+            return await _reply_to_comment_impl(
+                service, app_name, presentation_id, comment_id, reply_content
+            )
+
+        async def resolve_comment(presentation_id: str, comment_id: str) -> str:
+            """Resolve a comment in a Google Presentation."""
+            service = get_service()
+            return await _resolve_comment_impl(
+                service, app_name, presentation_id, comment_id
             )
 
     # Set the proper function names and register with server

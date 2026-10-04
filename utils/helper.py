@@ -10,8 +10,12 @@ from rich.logging import RichHandler
 
 import re
 import html
+import asyncio
+import json
 import unicodedata
+import aiosqlite
 from config.settings import CHECKPOINT_DB
+from config.settings import DEFAULT_THREAD_ID
 
 
 def clean_email_body(text: str) -> str:
@@ -270,3 +274,55 @@ def sanitize_history(messages):
             )
 
     return clean_history
+
+
+def format_tool_to_text(tool_name, tool_args_str):
+    try:
+        args = json.loads(tool_args_str)
+    except (json.JSONDecodeError, TypeError):
+        return f"[Action: {tool_name}] (Args: {tool_args_str})"
+
+    if not isinstance(args, dict):
+        return f"[Action: {tool_name}] (Args: {tool_args_str})"
+
+    arg_summary = ", ".join([f"{k}={v}" for k, v in args.items()])
+    return f"__Tool Action__: Used {tool_name} with inputs: {arg_summary}"
+
+
+mock_tool_sets = {"communication": [], "planning": [], "content": [], "supervisor": []}
+
+
+async def get_agent_state(thread_id: str):
+    """Print the saved graph state of a thread (run: python -m utils.helper)."""
+    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+    async with aiosqlite.connect(str(CHECKPOINT_DB)) as conn:
+        checkpointer = AsyncSqliteSaver(conn)
+
+        from core.graph import build_graph
+
+        graph = build_graph(mock_tool_sets, checkpointer)
+
+        config = {"configurable": {"thread_id": thread_id}}
+
+        snapshot = await graph.aget_state(config)
+
+        if not snapshot.values:
+            print("❌ No state found for this thread ID.")
+            return
+
+        values = snapshot.values
+        print("=" * 40)
+        print(f"📊 STATE FOR THREAD: {thread_id}")
+        print("=" * 40)
+        print(
+            f"🕒 Last Memory Timestamp: {datetime.fromtimestamp(values.get('last_memory_timestamp')) if values.get('last_memory_timestamp') else 'N/A'}"
+        )
+        print(f"🧠 Summary: {values.get('summary')}")
+        print(f"📨 Total Messages: {len(values.get('messages', []))}")
+        print(f"🔜 Next Step: {snapshot.next}")
+        print("=" * 40)
+
+
+if __name__ == "__main__":
+    asyncio.run(get_agent_state(DEFAULT_THREAD_ID))
