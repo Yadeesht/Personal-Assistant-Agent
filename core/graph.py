@@ -14,15 +14,11 @@ if not hasattr(langchain_core.tools.base, "TOOL_MESSAGE_BLOCK_TYPES"):
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode
+from langgraph.types import interrupt
 
-from config.prompts import (
-    COMMUNICATION_SYSTEM_PROMPT,
-    PLANNING_SYSTEM_PROMPT,
-    SUPERVISOR_SYSTEM_PROMPT,
-    DOCUMENT_SYSTEM_PROMPT,
-    PRESENTATION_SYSTEM_PROMPT,
-    DATA_SYSTEM_PROMPT,
-)
+# The prompt texts are read from the module when the graph is built, so /reload can
+# re-read config/prompts.py and rebuild without reloading any code.
+import config.prompts as prompt_texts
 from core.agent import (
     agent_node_factory,
     code_execution_factory,
@@ -43,7 +39,15 @@ from core.state import (
     route_after_document_tools,
     route_after_data_tools,
     route_after_presentation_tools,
+    route_after_memory,
     route_start,
+    route_to_active_agent,
+)
+from core.confirm import (
+    calls_needing_confirmation,
+    confirmation_request,
+    declined_messages,
+    is_approval,
 )
 from core.llm import build_llm, build_llm_with_tools
 from utils.helper import setup_logger
@@ -59,6 +63,16 @@ def create_agent_tool_node(tools, messages_key: str):
     tool_node = ToolNode(tools=tools, handle_tool_errors=True, messages_key=messages_key)
 
     async def node(state: State):
+        # Calls that cannot be undone (e.g. send_email) wait for the user's yes: the
+        # graph pauses here and main.py resumes it with the user's reply.
+        gated = calls_needing_confirmation(state.get(messages_key) or [])
+        if gated:
+            decision = interrupt(confirmation_request(gated)) or {}
+            reply = str(decision.get("reply", ""))
+            if not is_approval(reply):
+                declined = declined_messages(state[messages_key], reply)
+                return {messages_key: declined, "messages": declined}
+
         result = await tool_node.ainvoke(state)
 
         from langgraph.types import Command
@@ -106,36 +120,35 @@ def create_agent_tool_node(tools, messages_key: str):
     return node
 
 
+# Content tools are split between the document, data and presentation agents by tool
+# name. Keywords match as substrings: "form" also catches the Sheets conditional-
+# formatting tools, which is what routes them to the data agent.
+DOCUMENT_TOOL_KEYWORDS = ["doc", "drive", "table", "file"]
+DATA_TOOL_KEYWORDS = ["sheet", "form", "spreadsheet", "publish"]
+PRESENTATION_TOOL_KEYWORDS = ["presentation", "page", "slide"]
+
+
+def split_content_tools(content_tools):
+    """Split content tools into (document_tools, data_tools, presentation_tools) by tool name."""
+
+    def matches(tool, keywords):
+        return any(keyword in tool.name.lower() for keyword in keywords)
+
+    document_tools = [t for t in content_tools if matches(t, DOCUMENT_TOOL_KEYWORDS)]
+    data_tools = [t for t in content_tools if matches(t, DATA_TOOL_KEYWORDS)]
+    presentation_tools = [
+        t for t in content_tools if matches(t, PRESENTATION_TOOL_KEYWORDS)
+    ]
+    return document_tools, data_tools, presentation_tools
+
+
 def build_graph(tool_sets, checkpointer):
     supervisor_tools = tool_sets.get("supervisor", [])
     communication_tools = tool_sets.get("communication", [])
     planning_tools = tool_sets.get("planning", [])
     content_tools = tool_sets["content"]
 
-    document_tools = [
-        t
-        for t in content_tools
-        if any(
-            keyword in t.name.lower() for keyword in ["doc", "drive", "table", "file"]
-        )
-    ]
-
-    data_tools = [
-        t
-        for t in content_tools
-        if any(
-            keyword in t.name.lower()
-            for keyword in ["sheet", "form", "spreadsheet", "publish"]
-        )
-    ]
-
-    presentation_tools = [
-        t
-        for t in content_tools
-        if any(
-            keyword in t.name.lower() for keyword in ["presentation", "page", "slide"]
-        )
-    ]
+    document_tools, data_tools, presentation_tools = split_content_tools(content_tools)
 
     logger.info(
         f"🔧 Filtered Tools -> Docs: {len(document_tools)} | Data: {len(data_tools)} | Slides: {len(presentation_tools)}"
@@ -148,7 +161,9 @@ def build_graph(tool_sets, checkpointer):
     data_tools = list(data_tools) + [work_completion]
     presentation_tools = list(presentation_tools) + [work_completion]
 
-    supervisor_llm = build_llm_with_tools(supervisor_tools)
+    # One handoff per supervisor turn: parallel route_to_agent calls would hand the task
+    # to two workers at once, and only one of them can be the active agent.
+    supervisor_llm = build_llm_with_tools(supervisor_tools, parallel_tool_calls=False)
     communication_llm = build_llm_with_tools(communication_tools)
     planning_llm = build_llm_with_tools(planning_tools)
     document_llm = build_llm_with_tools(document_tools)
@@ -157,37 +172,39 @@ def build_graph(tool_sets, checkpointer):
 
     communication_agent_node = agent_node_factory(
         llm_with_tools=communication_llm,
-        system_prompt=COMMUNICATION_SYSTEM_PROMPT,
+        system_prompt=prompt_texts.COMMUNICATION_SYSTEM_PROMPT,
         agent_name="communication_agent",
     )
 
     planning_agent_node = agent_node_factory(
         llm_with_tools=planning_llm,
-        system_prompt=PLANNING_SYSTEM_PROMPT,
+        system_prompt=prompt_texts.PLANNING_SYSTEM_PROMPT,
         agent_name="planning_agent",
     )
 
+    # The code agent asks the model for plain text (intent, code), so it gets a model
+    # without tools: with the supervisor's tools bound it could answer with a tool call.
     code_agent_node = code_execution_factory(
-        llm=supervisor_llm,
+        llm=build_llm(),
         tool_sets=tool_sets,
         agent_name="code_agent",
     )
 
     document_agent_node = agent_node_factory(
         llm_with_tools=document_llm,
-        system_prompt=DOCUMENT_SYSTEM_PROMPT,
+        system_prompt=prompt_texts.DOCUMENT_SYSTEM_PROMPT,
         agent_name="document_agent",
     )
 
     presentation_agent_node = agent_node_factory(
         llm_with_tools=presentation_llm,
-        system_prompt=PRESENTATION_SYSTEM_PROMPT,
+        system_prompt=prompt_texts.PRESENTATION_SYSTEM_PROMPT,
         agent_name="presentation_agent",
     )
 
     data_agent_node = agent_node_factory(
         llm_with_tools=data_llm,
-        system_prompt=DATA_SYSTEM_PROMPT,
+        system_prompt=prompt_texts.DATA_SYSTEM_PROMPT,
         agent_name="data_agent",
     )
 
@@ -195,7 +212,7 @@ def build_graph(tool_sets, checkpointer):
 
     supervisor_node = supervisor_node_factory(
         llm_with_tools=supervisor_llm,
-        system_prompt=SUPERVISOR_SYSTEM_PROMPT,
+        system_prompt=prompt_texts.SUPERVISOR_SYSTEM_PROMPT,
         agent_name="supervisor",
     )
 
@@ -245,14 +262,32 @@ def build_graph(tool_sets, checkpointer):
             "document_agent": "document_agent",
             "presentation_agent": "presentation_agent",
             "data_agent": "data_agent",
+            # The user's reply to a code approval request resumes in code_agent.
+            "code_agent": "code_agent",
             "summerizer_node": "summerizer_node",
             "memory_update_node": "memory_update_node",
             "supervisor": "supervisor",
         },
     )
 
-    builder.add_edge("summerizer_node", "supervisor")
-    builder.add_edge("memory_update_node", "supervisor")
+    # After the memory and summary steps the message goes to the agent the user is
+    # talking to (a worker that asked a question, or the code agent waiting for
+    # approval), not always to the supervisor.
+    active_agents = {
+        "communication_agent": "communication_agent",
+        "planning_agent": "planning_agent",
+        "document_agent": "document_agent",
+        "presentation_agent": "presentation_agent",
+        "data_agent": "data_agent",
+        "code_agent": "code_agent",
+        "supervisor": "supervisor",
+    }
+    builder.add_conditional_edges(
+        "memory_update_node",
+        route_after_memory,
+        {**active_agents, "summerizer_node": "summerizer_node"},
+    )
+    builder.add_conditional_edges("summerizer_node", route_to_active_agent, active_agents)
 
     builder.add_conditional_edges(
         "supervisor",

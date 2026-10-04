@@ -1,5 +1,6 @@
 import asyncio
 import json
+import threading
 import time
 from datetime import datetime
 
@@ -13,20 +14,28 @@ from langchain_core.messages import (
     trim_messages,
 )
 
-from config.prompts import HISTORY_SUMMARIZE_PROMPT
+# Read at call time, so a /reload of config/prompts.py applies here too.
+import config.prompts as prompt_texts
 from config.settings import DEFAULT_THREAD_ID, MEMORY_DB
 from core.codeagent import CodeExecutionAgent
 from core.llm import build_llm
-from core.state import State
+from core.state import State, plan_summary
 from rag.episodic_rag import EpisodicRAG
 from utils.helper import (
     count_tokens,
     format_tool_to_text,
     get_current_time,
     request_counter,
+    sanitize_history,
     setup_logger,
 )
-from utils.memory_manager import log_event, sanitize_history
+from utils.memory_manager import (
+    MEMORY_PIPELINES,
+    get_memory_progress,
+    log_event,
+    set_memory_progress,
+)
+from langchain_core.runnables import RunnableConfig
 from langgraph.types import Command
 import langchain_core.tools.base
 from langchain_core.tools import tool, InjectedToolCallId
@@ -55,6 +64,8 @@ def clean_unmatched_tool_calls(messages: list) -> list:
     Ensures that any AIMessage with tool_calls is matched by subsequent ToolMessages.
     If any tool call lacks a corresponding ToolMessage in the rest of the list,
     the tool_calls are stripped from the AIMessage to avoid OpenAI API BadRequestError.
+    A ToolMessage whose tool call is not earlier in the list (e.g. the call was removed
+    by the summarizer) is dropped too: the API rejects a tool result without its call.
     """
     cleaned_messages = []
     
@@ -97,7 +108,16 @@ def clean_unmatched_tool_calls(messages: list) -> list:
         else:
             cleaned_messages.append(msg)
 
-    return cleaned_messages
+    answered_call_ids = set()
+    result = []
+    for msg in cleaned_messages:
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            answered_call_ids.update(tc.get("id") for tc in msg.tool_calls)
+        if isinstance(msg, ToolMessage) and msg.tool_call_id not in answered_call_ids:
+            continue
+        result.append(msg)
+
+    return result
 
 
 AGENT_MESSAGE_KEY = {
@@ -116,6 +136,88 @@ def _resolve_agent_messages(state: State, agent_name: str):
     return state.get(message_key, []) or state.get("messages", [])
 
 
+def _thread_id(config: RunnableConfig) -> str:
+    """The thread this run belongs to, so logs and memory follow /new and /thread."""
+    return (config or {}).get("configurable", {}).get("thread_id") or DEFAULT_THREAD_ID
+
+
+async def _memory_for_turn(state: State) -> tuple[str, str, str, dict]:
+    """Long-term memory for this turn: the user's standing instructions and profile
+    (always), and knowledge-graph facts related to the user's latest message (looked
+    up once per turn).
+
+    Returns (instructions, profile, recalled text, state updates). The recalled text is
+    kept in state with the id of the message it was looked up for, so the supervisor and
+    the workers of the same turn reuse one lookup. Recall leaves out the entities the
+    profile shows. Past conversations are not recalled here; the supervisor looks them
+    up on request.
+    """
+    from app_tools.tools.rag_tools import get_instructions_text, get_profile, recall_memory
+
+    instructions = await get_instructions_text()
+
+    try:
+        profile, profile_ids = await asyncio.to_thread(get_profile)
+    except Exception as e:
+        logger.error(f"Loading the memory profile failed: {e}")
+        profile, profile_ids = "", set()
+
+    latest = next(
+        (
+            m
+            for m in reversed(state.get("messages", []))
+            if isinstance(m, HumanMessage) and not m.name
+        ),
+        None,
+    )
+    if latest is None:
+        return instructions, profile, "", {}
+    if latest.id and state.get("recalled_for") == latest.id:
+        return instructions, profile, state.get("recalled_memory") or "", {}
+
+    query = latest.content if isinstance(latest.content, str) else str(latest.content)
+    try:
+        recalled = await asyncio.to_thread(recall_memory, query, profile_ids)
+    except Exception as e:
+        logger.error(f"Memory recall failed: {e}")
+        recalled = ""
+    if recalled:
+        logger.info(f"🧠 Recalled memory for this turn:\n{recalled}")
+    return (
+        instructions,
+        profile,
+        recalled,
+        {"recalled_memory": recalled, "recalled_for": latest.id},
+    )
+
+
+def _memory_messages(instructions: str, profile: str, recalled: str) -> list:
+    """The messages placed after an agent's system prompt: the user's standing
+    instructions (rules to follow), then long-term memory (facts that may be out of
+    date). None for what is empty."""
+    messages = []
+    if instructions:
+        messages.append(
+            SystemMessage(content=prompt_texts.STANDING_INSTRUCTIONS_TEMPLATE.format(instructions=instructions))
+        )
+    sections = []
+    if profile:
+        sections.append(f"About the user:\n{profile}")
+    if recalled:
+        sections.append(recalled)
+    if sections:
+        messages.append(
+            SystemMessage(content=prompt_texts.MEMORY_RECALL_TEMPLATE.format(memory="\n\n".join(sections)))
+        )
+    return messages
+
+
+def _summary_messages(state: State) -> list:
+    """The thread summary (older turns condensed by the summarizer), if there is one."""
+    summary = state.get("summary")
+    if not summary:
+        return []
+    return [SystemMessage(content=f"Conversation Summary of previous messages:\n{summary}")]
 
 
 def supervisor_node_factory(
@@ -125,9 +227,10 @@ def supervisor_node_factory(
 ):
     """Create the supervisor graph node with isolated supervisor context."""
 
-    async def supervisor_node(state: State):
+    async def supervisor_node(state: State, config: RunnableConfig):
         request_counter[agent_name] += 1
         request_num = request_counter[agent_name]
+        thread_id = _thread_id(config)
 
         current_time = get_current_time()
 
@@ -136,14 +239,9 @@ def supervisor_node_factory(
         scoped_messages = _resolve_agent_messages(state, agent_name)
         logger.info(f"📨 Messages in supervisor context: {len(scoped_messages)}")
 
-        last_messages = trim_messages(
-            scoped_messages,
-            max_tokens=30000,
-            strategy="last",
-            token_counter=count_tokens,
-            include_system=True,
-            start_on="human",
-        )
+        # No token cap: the supervisor sees its whole history. Long threads are condensed
+        # between turns by the summarizer (route_start), not trimmed here.
+        last_messages = list(scoped_messages)
 
         logger.info("=" * 80)
         if last_messages:  # this is for logs purpose only
@@ -151,17 +249,17 @@ def supervisor_node_factory(
             content_preview = json.dumps(content_preview[-2:], indent=2)
             logger.info(f"📝 Content preview: {content_preview}")
 
-        try:
-            summary = state.get("summary", None)
-            if summary:
-                summary_msg = SystemMessage(
-                    content=f"Conversation Summary of previous messages:\n{summary}"
-                )
-                last_messages = [summary_msg] + last_messages
+        instructions, profile, recalled, recall_updates = await _memory_for_turn(state)
 
+        try:
             final_prompt = system_prompt.replace("{current_time}", current_time)
 
-            message = [SystemMessage(content=final_prompt)] + last_messages
+            message = (
+                [SystemMessage(content=final_prompt)]
+                + _memory_messages(instructions, profile, recalled)
+                + _summary_messages(state)
+                + last_messages
+            )
             message = clean_unmatched_tool_calls(message)
             response = await llm_with_tools.ainvoke(message)
 
@@ -239,16 +337,16 @@ def supervisor_node_factory(
             has_tools = bool(getattr(response, "tool_calls", []))
             if has_tools:
                 await log_event(
-                    thread_id=DEFAULT_THREAD_ID,
+                    thread_id=thread_id,
                     actor=agent_name,
                     message=f"{', '.join([format_tool_to_text(tc.get('name', ''), json.dumps(tc.get('args', {}))) for tc in response.tool_calls])}",
                     metadata={"request_num": request_num, "type": "tool_call"},
                 )
             elif response.content:
                 await log_event(
-                    thread_id=DEFAULT_THREAD_ID,
+                    thread_id=thread_id,
                     actor=agent_name,
-                    message=f"Direct response: {response.content[:500]}",
+                    message=f"Direct response: {response.content}",
                     metadata={"request_num": request_num, "type": "content"},
                 )
         except Exception as e:
@@ -258,6 +356,7 @@ def supervisor_node_factory(
             "messages": [agent_message],
             "supervisor_messages": [agent_message],
             "current_agent": agent_name,
+            **recall_updates,
         }
 
     return supervisor_node
@@ -271,11 +370,12 @@ def agent_node_factory(llm_with_tools, system_prompt, agent_name: str):
     The returned node invokes the worker LLM with isolated agent context.
     """
 
-    async def agent_node(state: State):
+    async def agent_node(state: State, config: RunnableConfig):
 
         current_agent_name = agent_name
         request_counter[current_agent_name] += 1
         request_num = request_counter[current_agent_name]
+        thread_id = _thread_id(config)
 
         current_time = get_current_time()
 
@@ -284,29 +384,31 @@ def agent_node_factory(llm_with_tools, system_prompt, agent_name: str):
         logger.info(f"🔄 {current_agent_name.upper()} REQUEST #{request_num}")
         logger.info("=" * 80)
 
+        # No token cap: a worker sees its whole task history (a token cap starting on the
+        # handoff message emptied the context once tool results passed the cap).
         scoped_messages = _resolve_agent_messages(state, current_agent_name)
-        last_messages = trim_messages(
-            scoped_messages,
-            max_tokens=10000,
-            strategy="last",
-            token_counter=count_tokens,
-            include_system=True,
-            start_on="human",
-        )
+        last_messages = list(scoped_messages)
 
         logger.info(f"📨 Messages in conversation: {len(last_messages)}")
 
         logger.info("=" * 80)
         if last_messages:
             content_preview = sanitize_history(last_messages)
-            content_preview = json.dumps(content_preview, indent=2)
+            content_preview = json.dumps(content_preview[-5:], indent=2)
             logger.info(f"📝 Content preview: {content_preview}")
 
         logger.info("=" * 80)
 
+        instructions, profile, recalled, recall_updates = await _memory_for_turn(state)
+
         try:
             final_prompt = system_prompt.replace("{current_time}", current_time)
-            messages = [SystemMessage(content=final_prompt)] + last_messages
+            messages = (
+                [SystemMessage(content=final_prompt)]
+                + _memory_messages(instructions, profile, recalled)
+                + _summary_messages(state)
+                + last_messages
+            )
             messages = clean_unmatched_tool_calls(messages)
             logger.info(
                 f"🤖 Sending messages to LLM with {count_tokens(messages)} tokens"
@@ -373,7 +475,7 @@ def agent_node_factory(llm_with_tools, system_prompt, agent_name: str):
             has_tools = bool(getattr(msg, "tool_calls", []))
             if final_content and not has_tools:
                 await log_event(
-                    thread_id=DEFAULT_THREAD_ID,
+                    thread_id=thread_id,
                     actor=current_agent_name,
                     message=final_content,
                     metadata={
@@ -384,11 +486,23 @@ def agent_node_factory(llm_with_tools, system_prompt, agent_name: str):
 
             if has_tools:
                 await log_event(
-                    thread_id=DEFAULT_THREAD_ID,
+                    thread_id=thread_id,
                     actor=current_agent_name,
                     message=f"{', '.join([format_tool_to_text(tc.get('name', ''), json.dumps(tc.get('args', {}))) for tc in msg.tool_calls])}",
                     metadata={"type": "tool_call"},
                 )
+
+            # What the worker found and reports back. Tool-call rows are left out of
+            # long-term memory, so the result is logged on its own for memory to learn from.
+            for tc in getattr(msg, "tool_calls", None) or []:
+                handoff_result = (tc.get("args") or {}).get("message")
+                if tc.get("name") == "work_completion" and handoff_result:
+                    await log_event(
+                        thread_id=thread_id,
+                        actor=current_agent_name,
+                        message=handoff_result,
+                        metadata={"request_num": request_num, "type": "handoff_result"},
+                    )
         except Exception as e:
             logger.error(f"Failed to log audit event: {e}")
 
@@ -397,6 +511,7 @@ def agent_node_factory(llm_with_tools, system_prompt, agent_name: str):
             "messages": [agent_message],
             message_key: [agent_message],
             "current_agent": current_agent_name,
+            **recall_updates,
         }
 
     return agent_node
@@ -405,11 +520,12 @@ def agent_node_factory(llm_with_tools, system_prompt, agent_name: str):
 def code_execution_factory(llm, tool_sets, agent_name: str):
     """Create the code execution node that runs CodeExecutionAgent workflows with user permission checks and local Port 9000 sandbox."""
 
-    async def code_executor(state: State):
+    async def code_executor(state: State, config: RunnableConfig):
         """Execute one code-agent turn and return code or execution output depending on approval state."""
         import re
         current_time = get_current_time()
         current_agent_name = agent_name
+        thread_id = _thread_id(config)
 
         scoped_messages = _resolve_agent_messages(state, current_agent_name)
         
@@ -446,13 +562,13 @@ def code_execution_factory(llm, tool_sets, agent_name: str):
                     full_output = json.dumps(msg.get("full_output", {}), indent=2)
                     
                     await log_event(
-                        thread_id=DEFAULT_THREAD_ID,
+                        thread_id=thread_id,
                         actor="code_agent",
                         message=f"PLAN: {task_spec.primary_goal}\n\nEXECUTED CODE:\n```python\n{code_to_run}\n```",
                         metadata={"type": "code_execution"}
                     )
                     await log_event(
-                        thread_id=DEFAULT_THREAD_ID,
+                        thread_id=thread_id,
                         actor="code_agent",
                         message=f"EXECUTION RESULT:\nStatus: success\nSummary: {summary}\nDetails: {full_output}",
                         metadata={"type": "code_output", "status": "success"}
@@ -539,281 +655,510 @@ def code_execution_factory(llm, tool_sets, agent_name: str):
 
 
 
-async def summerizer_node(state: State):
-    """Condense long chat history into a compact summary and prune old messages."""
+def _clip(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit].rstrip() + " ...(cut)"
+
+
+def _transcript(messages: list) -> str:
+    """Readable lines for the summarizer: who said what, which tools were called and
+    what they returned (long text cut), instead of the raw message objects."""
+    lines = []
+    for m in messages:
+        content = m.content if isinstance(m.content, str) else json.dumps(m.content, default=str)
+        if isinstance(m, HumanMessage):
+            lines.append(f"{m.name or 'User'}: {_clip(content, 1500)}")
+        elif isinstance(m, AIMessage):
+            speaker = m.name or "assistant"
+            if content:
+                lines.append(f"{speaker}: {_clip(content, 1500)}")
+            for tc in m.tool_calls or []:
+                args = json.dumps(tc.get("args", {}), default=str)
+                lines.append(f"{speaker} called {tc.get('name')}({_clip(args, 800)})")
+        elif isinstance(m, ToolMessage):
+            lines.append(f"  -> result: {_clip(content, 400)}")
+    return "\n".join(lines)
+
+
+async def summerizer_node(state: State, config: RunnableConfig):
+    """Condense the older turns of the thread into the running summary and remove them.
+
+    Each message list over the limit (the shared one and each agent's own) is cut at a
+    turn boundary (core.state.plan_summary), so tool calls stay with their results. The
+    summary is shown to the supervisor and the workers. If the model call fails nothing
+    is removed and the next turn tries again.
+    """
     logger.info("📝 Summarizer node activated to condense conversation history.")
+    plan = plan_summary(state)
+    if not plan:
+        return {}
 
-    messages = state["messages"]
+    # One transcript of what is being archived: the shared list in order, then what
+    # lives only in an agent's own list (handoffs to workers and their results).
+    shared = plan.get("messages", [])
+    seen_ids = {m.id for m in shared}
+    agent_only = []
+    for channel, archived in plan.items():
+        if channel == "messages":
+            continue
+        for m in archived:
+            if m.id not in seen_ids:
+                seen_ids.add(m.id)
+                agent_only.append(m)
 
-    MAX_RECENT_TOKENS = 4000
-    current_tokens = 0
-    split_index = 0
+    transcript = _transcript(shared)
+    if agent_only:
+        transcript += "\n\nHandoffs between agents in these turns:\n" + _transcript(agent_only)
 
-    for i in range(len(messages) - 1, -1, -1):
-        msg_token_count = count_tokens([messages[i]])
+    prompt_content = (
+        f"CURRENT SUMMARY:\n{state.get('summary') or '(none yet)'}\n\n"
+        f"NEW CHAT MESSAGES:\n{transcript}"
+    )
+    try:
+        llm = build_llm()
+        cleaned = await llm.ainvoke(
+            [
+                SystemMessage(content=prompt_texts.HISTORY_SUMMARIZE_PROMPT),
+                SystemMessage(content=prompt_content),
+            ]
+        )
+        summarized_content = cleaned.content
+    except Exception as e:
+        logger.error(f"Summarizing failed; nothing removed, will retry next turn: {e}")
+        return {}
+    if not summarized_content:
+        logger.error("Summarizer returned nothing; nothing removed, will retry next turn.")
+        return {}
 
-        if (
-            current_tokens + msg_token_count > MAX_RECENT_TOKENS
-            and (len(messages) - i) > 2
-        ):
-            split_index = i + 1
-            break
-
-        current_tokens += msg_token_count
-    if split_index == 0:
-        split_index = max(0, len(messages) - 2)
-
-    messages_to_summerize = messages[:split_index]
+    updates = {"summary": summarized_content}
+    archived_count = 0
+    for channel, archived in plan.items():
+        removals = [RemoveMessage(id=m.id) for m in archived if m.id]
+        if removals:
+            updates[channel] = removals
+            archived_count += len(removals)
 
     logger.info(
-        f"📊 Dynamic split: Archiving {len(messages_to_summerize)} messages. Retaining {len(messages) - split_index} messages ({current_tokens} tokens)."
+        "📊 Archived "
+        + ", ".join(f"{len(archived)} from {channel}" for channel, archived in plan.items())
     )
-
-    # right now the prompt is not aware of we sending the summary and to summerize previous messages too
-    prompt_content = f"Summary:\n{state.get('summary', '')}\n\n Chat Messages:\n{messages_to_summerize}"
-    llm = build_llm()
-    messages = [
-        SystemMessage(content=HISTORY_SUMMARIZE_PROMPT),
-        SystemMessage(content=prompt_content),
-    ]
-    cleaned = await llm.ainvoke(messages)
-
-    summarized_content = cleaned.content
-
-    delete_actions = []
-    missing_ids_count = 0
-    for m in messages_to_summerize:
-        if m.id:
-            delete_actions.append(RemoveMessage(id=m.id))
-        else:
-            missing_ids_count += 1
-
-    if missing_ids_count > 0:
-        logger.warning(
-            f"⚠️ Found {missing_ids_count} messages without IDs that cannot be removed."
-        )
 
     try:
         await log_event(
-            thread_id=DEFAULT_THREAD_ID,
+            thread_id=_thread_id(config),
             actor="summerizer_node",
             message=f"summerized content: {summarized_content}",
-            metadata={
-                "archived_messages": len(delete_actions),
-                "unremovable_messages": missing_ids_count,
-            },
+            metadata={"archived_messages": archived_count},
         )
     except Exception as e:
         logger.error(f"Failed to log summarizer audit event: {e}")
 
-    updates = {"summary": summarized_content, "messages": delete_actions}
-
-    # The global "messages" channel doesn't mirror every scoped-agent
-    # message 1:1 (e.g. supervisor handoff seeds only live in the scoped
-    # channel), so per-agent channels never shrink if we only prune here.
-    # Mirror the deletion into each scoped channel, but only for ids that
-    # actually exist there — add_messages raises if asked to remove an id
-    # it doesn't have.
-    ids_to_remove = {m.id for m in messages_to_summerize if getattr(m, "id", None)}
-    if ids_to_remove:
-        for message_key in AGENT_MESSAGE_KEY.values():
-            scoped_messages = state.get(message_key, [])
-            scoped_ids = {
-                m.id for m in scoped_messages if getattr(m, "id", None)
-            }
-            matched_ids = ids_to_remove & scoped_ids
-            if matched_ids:
-                updates[message_key] = [
-                    RemoveMessage(id=mid) for mid in matched_ids
-                ]
-
     return updates
+
+
+# One memory run at a time, across threads: saves run on the background saver's thread
+# (with its own event loop), and two runs must not store the same logs twice.
+_flush_lock = threading.Lock()
+
+# Token budget for one knowledge-graph extraction call. A long backlog is sent in batches
+# (one thread per batch), and each stored batch moves the progress mark.
+KG_BATCH_TOKENS = 6000
+
+
+async def flush_memory(reason: str = "", logged_before: datetime | None = None) -> dict:
+    """Store every log not yet in long-term memory, from all threads.
+
+    Runs the knowledge-graph and episodic-RAG pipelines over the human_logs rows past each
+    pipeline's progress mark (see utils.memory_manager). A pipeline moves its mark only
+    after a batch is stored, so a failed run is retried next time instead of being skipped.
+
+    logged_before: only store logs written before this time.
+    Returns {pipeline: True if it is now up to date}.
+    """
+    with _flush_lock:
+        logger.info(f"🧠 Saving long-term memory ({reason or 'requested'})")
+        return {
+            "knowledge_graph": await updation_knowledge_graph(MEMORY_DB, logged_before),
+            "episodic_rag": await updation_episodic_rag(MEMORY_DB, logged_before),
+        }
+
+
+class BackgroundMemorySaver:
+    """Saves long-term memory on a background thread, so a chat is not held up while
+    the knowledge-graph model calls and embeddings run.
+
+    request() starts a save. If one is already running, one more run is queued, so logs
+    written in the meantime are included. wait() blocks until saving is done (used on
+    exit). Each save runs flush_memory in its own event loop on the saver's thread. The
+    thread is a daemon: a forced quit (Ctrl+C) does not wait for it, and whatever it had
+    not stored yet is stored at the next startup.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._thread = None
+        self._queued = None  # (reason, logged_before) of the next run
+        self.last_result = None
+
+    @property
+    def running(self) -> bool:
+        thread = self._thread
+        return thread is not None and thread.is_alive()
+
+    def request(self, reason: str, logged_before: datetime | None = None):
+        with self._lock:
+            if self.running:
+                # Keep the widest queued run: no time limit covers everything.
+                queued_before = self._queued[1] if self._queued else None
+                if (
+                    self._queued is None
+                    or logged_before is None
+                    or (queued_before is not None and logged_before > queued_before)
+                ):
+                    self._queued = (reason, logged_before)
+                return
+            self._thread = threading.Thread(
+                target=self._run,
+                args=(reason, logged_before),
+                name="memory-saver",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def _run(self, reason: str, logged_before: datetime | None):
+        while True:
+            try:
+                self.last_result = asyncio.run(flush_memory(reason, logged_before))
+            except Exception as e:
+                logger.error(f"Background memory save failed: {e}")
+                self.last_result = {pipeline: False for pipeline in MEMORY_PIPELINES}
+            if not all(self.last_result.values()):
+                failed = ", ".join(p for p, ok in self.last_result.items() if not ok)
+                logger.warning(
+                    f"Memory not fully saved ({failed}); it will be retried next time."
+                )
+            with self._lock:
+                if self._queued is None:
+                    self._thread = None
+                    return
+                reason, logged_before = self._queued
+                self._queued = None
+
+    def wait(self, timeout: float | None = None) -> bool:
+        """Block until saving is done. Returns False if it is still running at timeout."""
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout)
+        return not self.running
+
+
+# The process-wide saver used by main.py and the new-day memory node.
+memory_saver = BackgroundMemorySaver()
+
+
+async def _last_log_id(db, logged_before: datetime | None = None) -> int:
+    """Highest human_logs id (written before logged_before, if given)."""
+    query = "SELECT COALESCE(MAX(id), 0) FROM human_logs"
+    params = ()
+    if logged_before is not None:
+        query += " WHERE timestamp < ?"
+        params = (logged_before.isoformat(),)
+    async with db.execute(query, params) as cursor:
+        return (await cursor.fetchone())[0]
 
 
 def memory_node_factory():
     """Create the memory maintenance node.
 
-    The returned node updates long-term memory systems (knowledge graph and
-    episodic RAG) and refreshes memory-related timestamps in graph state.
+    route_start sends a turn here when logs from an earlier day are not in long-term
+    memory yet (a session that ran past midnight). The node hands those logs to the
+    background saver and the turn carries on; today's logs are stored on /new, /thread
+    or exit. It also refreshes the memory timestamps in graph state.
     """
 
-    async def memory_node(state: State):
-        """Run memory update pipelines and return state update fields."""
-        from config.settings import DEFAULT_THREAD_ID, MEMORY_DB
-        from core.agent import updation_episodic_rag, updation_knowledge_graph
+    async def memory_node(state: State, config: RunnableConfig):
+        """Start saving earlier days' logs and return state update fields."""
+        start_of_today = datetime.now().replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        memory_saver.request("new day", logged_before=start_of_today)
 
         now_float = time.time()
-
-        updates = {}
-
-        await updation_knowledge_graph(
-            state=state, thread_id=DEFAULT_THREAD_ID, db_path=MEMORY_DB
-        )
-
-        await updation_episodic_rag(
-            past_summary_date=state.get("last_memory_timestamp", 0.0), db_path=MEMORY_DB
-        )
-
-        updates["last_knowledgegraph_timestamp"] = now_float
-
-        updates["last_memory_timestamp"] = now_float
-        return updates
+        return {
+            "last_knowledgegraph_timestamp": now_float,
+            "last_memory_timestamp": now_float,
+        }
 
     return memory_node
 
 
-async def updation_episodic_rag(past_summary_date=None, db_path=MEMORY_DB):
-    """Update episodic RAG index from memory logs after a given timestamp."""
+async def updation_episodic_rag(db_path=MEMORY_DB, logged_before=None) -> bool:
+    """Index the logs the episodic RAG has not stored yet. Returns True when up to date."""
     try:
-        logger.info("🔄 Starting episodic RAG update process.")
+        async with aiosqlite.connect(db_path) as db:
+            after_id = await get_memory_progress(db, "episodic_rag")
+            up_to_id = await _last_log_id(db, logged_before)
 
-        if past_summary_date is None or past_summary_date == 0.0:
-            past_summary_date = None
-            logger.info("No previous timestamp found, fetching all available logs")
+        if up_to_id <= after_id:
+            logger.info("Episodic RAG is up to date.")
+            return True
 
-        if past_summary_date is not None:
-            if isinstance(past_summary_date, float):
-                past_summary_date_iso = datetime.fromtimestamp(
-                    past_summary_date
-                ).isoformat()
-            elif isinstance(past_summary_date, datetime):
-                past_summary_date_iso = past_summary_date.isoformat()
-            else:
-                past_summary_date_iso = str(past_summary_date)
-
-            logger.info(f"Fetching logs after: {past_summary_date_iso}")
-        else:
-            logger.info("Fetching ALL logs from database")
-
+        logger.info(f"🔄 Episodic RAG: indexing logs {after_id + 1}-{up_to_id}.")
         rag = EpisodicRAG(db_path=db_path)
-        chunks = await rag.custom_text_splitters(past_summary_date=past_summary_date)
+        chunks = await rag.custom_text_splitters(log_id_range=(after_id, up_to_id))
 
-        if not chunks:
-            logger.info("No chunks generated - no new data to index.")
-            return
+        if chunks and not rag.index_creation(chunks):
+            logger.error(
+                "Episodic RAG indexing failed; these logs will be retried next time."
+            )
+            return False
 
-        rag.index_creation(chunks)
-        logger.info("✅ Episodic RAG update process completed successfully.")
+        async with aiosqlite.connect(db_path) as db:
+            await set_memory_progress(db, "episodic_rag", up_to_id)
+        logger.info(f"✅ Episodic RAG stored {len(chunks)} chunks.")
+        return True
     except Exception as e:
-        logger.error(f"Episodic RAG update failed: {e}")
+        logger.error(
+            f"Episodic RAG update failed; these logs will be retried next time: {e}"
+        )
+        return False
 
 
-async def updation_knowledge_graph(
-    state: State, thread_id: str, db_path: str = MEMORY_DB
-):
-    """Extract new facts from logs and apply create/update ops to knowledge graph."""
+# Whose log lines the knowledge graph learns from, and how each is labelled for the
+# extraction model: the user, the supervisor's replies, and what the workers found in
+# SIR's apps (their replies and work_completion results).
+KG_ACTOR_LABELS = {
+    "Human_node": "Yadeesh (user)",
+    "supervisor": "Assistant",
+    "communication_agent": "Gmail agent (found in Yadeesh's mailbox)",
+    "planning_agent": "Calendar agent (found in Yadeesh's calendar and tasks)",
+    "document_agent": "Docs agent (found in Yadeesh's Drive and Docs)",
+    "data_agent": "Sheets agent (found in Yadeesh's Sheets and Forms)",
+    "presentation_agent": "Slides agent (found in Yadeesh's Slides)",
+}
+
+
+def _kg_batches(rows, max_tokens=KG_BATCH_TOKENS):
+    """Split (id, thread_id, timestamp, actor, message) rows into one-thread batches
+    under max_tokens."""
+    batch, batch_tokens = [], 0
+    for row in rows:
+        tokens = count_tokens(row[4] or "")
+        if batch and (row[1] != batch[-1][1] or batch_tokens + tokens > max_tokens):
+            yield batch
+            batch, batch_tokens = [], 0
+        batch.append(row)
+        batch_tokens += tokens
+    if batch:
+        yield batch
+
+
+async def updation_knowledge_graph(db_path: str = MEMORY_DB, logged_before=None) -> bool:
+    """Extract facts from the logs the knowledge graph has not stored yet and apply them.
+
+    Returns True when up to date. Stops at the first batch that fails (e.g. the model is
+    unreachable) so it is retried next time; batches stored before it stay stored.
+    """
     try:
         # Reuse the shared singleton (app_tools.tools.rag_tools) instead of
         # opening a second kuzu.Database on the same path — kuzu does not
         # support multiple concurrent connections to one database file from
         # the same process.
-        from app_tools.tools.rag_tools import get_kg_instance
-
-        logger.info("🔄 Starting knowledge graph update process.")
-        last_update = state.get("last_knowledgegraph_timestamp", 0.0)
-
-        if isinstance(last_update, float):
-            last_update_str = datetime.fromtimestamp(last_update).isoformat()
-
-        elif isinstance(last_update, datetime):
-            last_update_str = last_update.isoformat()
-
-        else:
-            last_update_str = str(last_update)
-
-        query = """
-            SELECT actor, message
-            FROM human_logs
-            WHERE thread_id = ?
-            AND actor IN (?,?)
-            AND timestamp > ?
-            AND COALESCE(json_extract(metadata, '$.type'), '') != 'tool_call'
-            ORDER BY timestamp ASC;
-        """
-
-        target_actors = ("Human_node", "supervisor")
+        from app_tools.tools.rag_tools import get_kg_instance, invalidate_profile
 
         async with aiosqlite.connect(db_path) as db:
+            after_id = await get_memory_progress(db, "knowledge_graph")
+            up_to_id = await _last_log_id(db, logged_before)
+            if up_to_id <= after_id:
+                logger.info("Knowledge graph is up to date.")
+                return True
+
+            # Only the conversation itself: the user's messages, and the replies and
+            # results the agents give. Tool calls, tool output, code-agent output and
+            # summaries never reach the graph, whatever is logged in the future.
+            target_actors = tuple(KG_ACTOR_LABELS)
+            query = f"""
+                SELECT id, thread_id, timestamp, actor, message
+                FROM human_logs
+                WHERE id > ? AND id <= ?
+                AND actor IN ({", ".join("?" for _ in target_actors)})
+                AND (
+                    actor = 'Human_node'
+                    OR json_extract(metadata, '$.type') IN ('content', 'handoff_result')
+                )
+                ORDER BY id ASC;
+            """
             async with db.execute(
-                query, (thread_id, *target_actors, last_update_str)
+                query, (after_id, up_to_id, *target_actors)
             ) as cursor:
                 rows = await cursor.fetchall()
-                logger.info(f"🔎 Found {len(rows)} new log entries in DB.")
-
-        if not rows:
-            logger.info("↩️ No new logs found since last update. Exiting.")  # NEW LOG
-            return
-
-        extraction_context = "\n".join([f"{actor}: {msg}" for actor, msg in rows])
-        kg = get_kg_instance()
-        candidates_json = kg.generate_entity_relation(extraction_context)
 
         logger.info(
-            f"Extracted candidates for KG update: {json.dumps(candidates_json, indent=2)}"
+            f"🔄 Knowledge graph: {len(rows)} new log entries (logs {after_id + 1}-{up_to_id})."
         )
 
-        if not candidates_json.get("candidates", {}).get(
-            "entities"
-        ) and not candidates_json.get("candidates", {}).get("relationships"):
-            logger.info(
-                "🔍 No valid entities or relationships found. Exiting update process."
+        kg = get_kg_instance() if rows else None
+        for batch in _kg_batches(rows):
+            extraction_context = "\n".join(
+                f"{KG_ACTOR_LABELS.get(actor, actor)}: {msg}"
+                for _id, _thread, _ts, actor, msg in batch
             )
-            return
-        entities = candidates_json.get("candidates", {}).get("entities", [])
+            _id, thread, timestamp, _actor, _msg = batch[0]
+            learned_from = f"conversation (thread {thread}) on {str(timestamp)[:10]}"
+            store_facts(kg, extraction_context, learned_from)
+            async with aiosqlite.connect(db_path) as db:
+                await set_memory_progress(db, "knowledge_graph", batch[-1][0])
 
-        types_df = kg.search_similar_node(entities)
+        # Also covers the rows the query filters out (tool calls, code agent output).
+        async with aiosqlite.connect(db_path) as db:
+            await set_memory_progress(db, "knowledge_graph", up_to_id)
 
-        final_update_json = kg.validate_entity_relation(types_df, candidates_json)
-        resolution = final_update_json.get("resolution", {})
-
-        logger.info(
-            f"The validated KG update resolution: {json.dumps(resolution, indent=2)}"
-        )
-        for entity in resolution.get("entities", []):
-            action = entity.get("action", "DISCARD").upper()
-
-            if action == "CREATE":
-                kg.add_entity(
-                    node_id=entity["id"],
-                    node_type=entity.get("type", "unknown"),
-                    search_keywords=", ".join(entity.get("search_keywords", [])),
-                    description=entity.get("description", ""),
-                )
-            elif action == "UPDATE":
-                kg.add_entity(
-                    node_id=entity.get("id"),
-                    node_type=entity.get("type") or "unknown",
-                    search_keywords=", ".join(entity.get("search_keywords", [])),
-                    description=entity.get("description") or "",
-                )
-
-        for rel in resolution.get("relationships", []):
-            action = rel.get("action", "DISCARD").upper()
-
-            if action == "CREATE":
-                kg.add_relationship(
-                    source=rel["source"],
-                    target=rel["target"],
-                    relation_type=rel.get("relation_type", "unknown"),
-                )
-            elif action == "UPDATE":
-                kg.modify_relationship(
-                    source=rel["source"],
-                    target=rel["target"],
-                    relation_type=rel.get("relation_type", "unknown"),
-                )
+        if kg is not None:
+            invalidate_profile()
+            kg.visualize()
         logger.info("✅ Knowledge graph update process completed successfully.")
-        kg.visualize()
+        return True
 
     except Exception as e:
-        logger.error(f"Knowledge graph update failed: {e}")
+        logger.error(
+            f"Knowledge graph update failed; the remaining logs will be retried next time: {e}"
+        )
+        return False
+
+
+def _keywords(value) -> str:
+    """search_keywords as stored: comma-separated (the model returns a list or a string)."""
+    if isinstance(value, (list, tuple)):
+        return ", ".join(str(v) for v in value)
+    return str(value or "")
+
+
+def store_facts(kg, text: str, learned_from: str = "", explicit: bool = False) -> dict:
+    """Extract entities and relationships from text and write them to the knowledge graph.
+
+    Used for conversation logs (memory saves) and for what the user explicitly asks to
+    store (add_information_to_knowledge_graph, explicit=True), with the same extraction
+    and validation rules either way; types and relationship names are normalized.
+
+    Raises if the model cannot be reached, so a memory save retries the batch later. A
+    reply that is not valid JSON is retried once; if it fails again the text is skipped
+    (and logged), so one bad batch cannot block every later log.
+
+    Returns {"status": "stored" | "nothing_new" | "skipped", "entities": n, "relationships": n}.
+    """
+    from rag.knowledge_graph import normalize_candidates
+
+    counts = {"entities": 0, "relationships": 0}
+    prompt = prompt_texts.KNOWLEDGE_GRAPH_EXTRACTION_PROMPT
+    if explicit:
+        prompt += "\n\n" + prompt_texts.KNOWLEDGE_GRAPH_EXPLICIT_NOTE
+
+    candidates_json = kg.generate_entity_relation(text, prompt)
+    if candidates_json is None:
+        candidates_json = kg.generate_entity_relation(text, prompt)
+    if candidates_json is None:
+        logger.error("Knowledge graph extraction returned invalid JSON twice; skipping this text.")
+        return {"status": "skipped", **counts}
+    normalize_candidates(candidates_json)
+
+    logger.info(
+        f"Extracted candidates for KG update: {json.dumps(candidates_json, indent=2)}"
+    )
+
+    candidates = candidates_json.get("candidates") or {}
+    if not candidates.get("entities") and not candidates.get("relationships"):
+        logger.info("🔍 No valid entities or relationships found in this text.")
+        return {"status": "nothing_new", **counts}
+    entities = candidates.get("entities") or []
+
+    types_df = kg.search_similar_node(entities)
+
+    validation_prompt = prompt_texts.KNOWLEDGE_GRAPH_VALIDATION_PROMPT
+    final_update_json = kg.validate_entity_relation(types_df, candidates_json, validation_prompt)
+    if final_update_json is None:
+        final_update_json = kg.validate_entity_relation(types_df, candidates_json, validation_prompt)
+    if final_update_json is None:
+        logger.error("Knowledge graph validation returned invalid JSON twice; skipping this text.")
+        return {"status": "skipped", **counts}
+    resolution = final_update_json.get("resolution", {})
+
+    logger.info(
+        f"The validated KG update resolution: {json.dumps(resolution, indent=2)}"
+    )
+    for entity in resolution.get("entities", []):
+        action = entity.get("action", "DISCARD").upper()
+        if action in ("CREATE", "UPDATE") and entity.get("id"):
+            kg.add_entity(
+                node_id=entity["id"],
+                node_type=entity.get("type") or "Concept",
+                search_keywords=_keywords(entity.get("search_keywords")),
+                description=entity.get("description") or "",
+                learned_from=learned_from,
+            )
+            counts["entities"] += 1
+
+    for rel in resolution.get("relationships", []):
+        action = rel.get("action", "DISCARD").upper()
+        if not rel.get("source") or not rel.get("target"):
+            continue
+        # UPDATE is stored like CREATE: add_relationship refreshes an existing edge and
+        # never renames other relationships between the same two entities.
+        if action in ("CREATE", "UPDATE"):
+            kg.add_relationship(
+                source=rel["source"],
+                target=rel["target"],
+                relation_type=rel.get("relation_type") or "RELATED_TO",
+            )
+            counts["relationships"] += 1
+
+    status = "stored" if counts["entities"] or counts["relationships"] else "nothing_new"
+    return {"status": status, **counts}
+
+
+# What a worker starts with: the user's own words, never a paraphrase, plus a fixed instruction.
+WORKER_HANDOFF_TEMPLATE = (
+    "[Handoff from supervisor]\n"
+    "User request (the user's exact words):\n{request}\n"
+    "{context}"
+    "\nDo the part of this request that your tools cover. When you are done, call "
+    "`work_completion` with the result; if part of the request needs another app, say what is left."
+)
+
+# A look-up for another worker: find information only, so nothing is done out of order
+# (e.g. emailing a schedule before the meetings are booked).
+WORKER_LOOKUP_TEMPLATE = (
+    "[Look-up request from supervisor]\n"
+    "User request (the user's exact words, for background only; other agents handle the rest of it):\n{request}\n"
+    "{context}"
+    "\nFind and return only this: {lookup}\n"
+    "Use your tools to look it up. Do not create, change, send or delete anything in this handoff. "
+    "When you are done, call `work_completion` with what you found (the actual names, addresses, dates, "
+    "IDs or text), or say plainly that it is not in your app."
+)
+
+# The code agent has no `work_completion` tool: it generates code, asks for approval and
+# hands back to the supervisor itself after running it.
+CODE_HANDOFF_TEMPLATE = (
+    "[Handoff from supervisor]\n"
+    "User request (the user's exact words):\n{request}\n"
+    "{context}"
+)
+
+
+def _latest_user_request(state: dict) -> str:
+    """The user's latest message, verbatim (user messages are the unnamed HumanMessages)."""
+    for m in reversed(state.get("messages", [])):
+        if isinstance(m, HumanMessage) and not m.name:
+            return m.content if isinstance(m.content, str) else str(m.content)
+    return ""
 
 
 @tool
 def route_to_agent(
+    state: Annotated[dict, InjectedState],
     tool_call_id: Annotated[str, InjectedToolCallId],
     agent: str,
-    message: str,
+    context: str = "",
+    lookup: str = "",
 ) -> Command:
     """
     Route the conversation to the correct specialized agent.
@@ -822,15 +1167,21 @@ def route_to_agent(
     yourself. The moment you identify the user's intent, route immediately.
 
     AGENT DOMAINS:
-    - communication_agent: Gmail, sending emails, checking email, messaging.
+    - communication_agent: Gmail, sending emails, checking email.
     - planning_agent: Google Calendar, Google Tasks, creating meetings, scheduling.
     - document_agent: Google Drive, Google Docs, document creation, drive lookup.
     - data_agent: Google Sheets, Google Forms, spreadsheets, tables.
     - presentation_agent: Google Slides, presentations.
     - code_agent: Executing Python code, complex computations, data science sandboxing.
 
-    message: The seed context the worker agent will start with. Describe clearly
-      what the user is asking and provide any relevant parameters already extracted.
+    The worker automatically receives the user's latest message word for word.
+
+    context: Optional. Only facts the worker cannot find itself: results from earlier
+      workers (names, addresses, dates, IDs, text) or what the user said in earlier turns.
+      Leave it empty on a first handoff. Never rephrase the request or add instructions.
+    lookup: Optional. Set it only to ask this worker to FIND information another worker
+      needs (e.g. "the names and email addresses of Yadeesh's direct reports"). The worker
+      then only looks it up and changes nothing. Leave it empty for a normal handoff.
     """
     if agent == "code_agent":
         import json
@@ -869,9 +1220,15 @@ def route_to_agent(
         tool_call_id=tool_call_id,
     )
 
-    worker_seed = HumanMessage(
-        content=f"[Supervisor Handoff]: {message}", name="supervisor"
-    )
+    context_block = f"\nContext from earlier steps:\n{context.strip()}\n" if context and context.strip() else ""
+    request = _latest_user_request(state)
+    if agent == "code_agent":
+        seed_text = CODE_HANDOFF_TEMPLATE.format(request=request, context=context_block)
+    elif lookup and lookup.strip():
+        seed_text = WORKER_LOOKUP_TEMPLATE.format(request=request, context=context_block, lookup=lookup.strip())
+    else:
+        seed_text = WORKER_HANDOFF_TEMPLATE.format(request=request, context=context_block)
+    worker_seed = HumanMessage(content=seed_text, name="supervisor")
 
     agent_key_map = {
         "communication_agent": "communication_messages",

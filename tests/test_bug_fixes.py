@@ -84,7 +84,6 @@ def test_service_decoder_resolves_correct_api_names(tmp_path):
 
     cases = [
         ("gdrive", "gdrive", "drive"),
-        ("gchat", "gchat", "chat"),
         ("tasks", "tasks", "tasks"),
         ("gmail", "gmail", "gmail"),
         ("docs", "docs", "docs"),
@@ -565,16 +564,27 @@ def test_keyword_listener_runs_on_a_plain_thread_and_delivers_input():
                 raise val
             return val
 
+        turn_ready = threading.Event()
+        turn_ready.set()
+
         with patch("builtins.input", side_effect=fake_input):
             thread = threading.Thread(
                 target=main_mod.keyword_listener,
-                args=(queue, loop, agent_state),
+                args=(queue, loop, agent_state, turn_ready),
                 daemon=True,
             )
             thread.start()
 
             item = await asyncio.wait_for(queue.get(), timeout=5)
             assert item == ("TEXT", "hello world")
+
+            # The listener waits for the turn to finish before reading again;
+            # main() signals that with turn_ready.
+            turn_ready.set()
+
+            # EOF ends the session the same way typing "exit" does.
+            item = await asyncio.wait_for(queue.get(), timeout=5)
+            assert item == ("TEXT", "exit")
 
             # Thread must exit on its own (EOFError) -- this is exactly the
             # condition that used to hang the process on quit. Note: join

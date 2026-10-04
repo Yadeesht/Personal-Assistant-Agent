@@ -14,19 +14,35 @@ from utils.helper import count_tokens, setup_logger
 logger = setup_logger(__name__)
 
 
+HUMAN_LOGS_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS human_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        thread_id TEXT,
+        timestamp TEXT,
+        actor TEXT,
+        message TEXT,
+        metadata TEXT
+    )
+"""
+
+# How far each long-term memory pipeline has processed human_logs, by row id.
+# Row ids only grow, so "id > last_log_id" is exactly the unprocessed logs of every
+# thread, and a pipeline moves its mark only after a batch is stored successfully.
+MEMORY_PROGRESS_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS memory_progress (
+        pipeline TEXT PRIMARY KEY,
+        last_log_id INTEGER NOT NULL,
+        updated_at TEXT
+    )
+"""
+
+MEMORY_PIPELINES = ("knowledge_graph", "episodic_rag")
+
+
 async def log_event(thread_id: str, actor: str, message: str, metadata: dict = None):
     """Saves a human-readable log entry to a separate table."""
     async with aiosqlite.connect(MEMORY_DB) as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS human_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                thread_id TEXT,
-                timestamp TEXT,
-                actor TEXT,
-                message TEXT,
-                metadata TEXT
-            )
-        """)
+        await db.execute(HUMAN_LOGS_SCHEMA)
         await db.execute(
             "INSERT INTO human_logs (thread_id, timestamp, actor, message, metadata) VALUES (?, ?, ?, ?, ?)",
             (
@@ -34,10 +50,138 @@ async def log_event(thread_id: str, actor: str, message: str, metadata: dict = N
                 datetime.now().isoformat(),
                 actor,
                 message,
-                str(metadata or {}),
+                # Real JSON, so the json_extract filters in the memory queries can read it.
+                json.dumps(metadata or {}, default=str),
             ),
         )
         await db.commit()
+
+
+# Standing instructions: how the user wants things done from now on ("always ask before
+# sending an email"). Kept as plain rows, not in the knowledge graph (which holds facts
+# about people, projects and organizations), and shown to every agent on every message.
+INSTRUCTIONS_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS user_instructions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        text TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        active INTEGER NOT NULL DEFAULT 1
+    )
+"""
+
+
+async def add_instruction(text: str) -> int:
+    """Store a standing instruction; returns its id."""
+    async with aiosqlite.connect(MEMORY_DB) as db:
+        await db.execute(INSTRUCTIONS_SCHEMA)
+        cursor = await db.execute(
+            "INSERT INTO user_instructions (text, created_at) VALUES (?, ?)",
+            (text.strip(), datetime.now().isoformat(timespec="seconds")),
+        )
+        await db.commit()
+        return cursor.lastrowid
+
+
+async def list_instructions() -> list:
+    """Active standing instructions, oldest first, as (id, text, created_at)."""
+    async with aiosqlite.connect(MEMORY_DB) as db:
+        await db.execute(INSTRUCTIONS_SCHEMA)
+        async with db.execute(
+            "SELECT id, text, created_at FROM user_instructions WHERE active = 1 ORDER BY id"
+        ) as cursor:
+            return await cursor.fetchall()
+
+
+async def remove_instruction(instruction_id: int) -> bool:
+    """Stop applying a standing instruction (kept in the table, marked inactive)."""
+    async with aiosqlite.connect(MEMORY_DB) as db:
+        await db.execute(INSTRUCTIONS_SCHEMA)
+        cursor = await db.execute(
+            "UPDATE user_instructions SET active = 0 WHERE id = ? AND active = 1",
+            (int(instruction_id),),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def get_memory_progress(db, pipeline: str) -> int:
+    """Last human_logs id the pipeline has stored. Creates the record on first use.
+
+    First use on an existing memory.db starts at 0: every log not yet in the progress
+    table is processed once. Call init_memory_progress() first to skip logs an older
+    version of the memory layer already stored.
+    """
+    await db.execute(HUMAN_LOGS_SCHEMA)
+    await db.execute(MEMORY_PROGRESS_SCHEMA)
+    async with db.execute(
+        "SELECT last_log_id FROM memory_progress WHERE pipeline = ?", (pipeline,)
+    ) as cursor:
+        row = await cursor.fetchone()
+    if row is not None:
+        return row[0]
+    await db.execute(
+        "INSERT INTO memory_progress (pipeline, last_log_id, updated_at) VALUES (?, 0, ?)",
+        (pipeline, datetime.now().isoformat()),
+    )
+    await db.commit()
+    return 0
+
+
+async def set_memory_progress(db, pipeline: str, last_log_id: int):
+    """Record that the pipeline has stored every log up to last_log_id."""
+    await db.execute(MEMORY_PROGRESS_SCHEMA)
+    await db.execute(
+        """
+        INSERT INTO memory_progress (pipeline, last_log_id, updated_at) VALUES (?, ?, ?)
+        ON CONFLICT(pipeline) DO UPDATE SET
+            last_log_id = MAX(last_log_id, excluded.last_log_id),
+            updated_at = excluded.updated_at
+        """,
+        (pipeline, last_log_id, datetime.now().isoformat()),
+    )
+    await db.commit()
+
+
+async def init_memory_progress(processed_until: float | None):
+    """One-time migration from the old per-thread memory timestamps.
+
+    The old memory layer kept "processed until" as a timestamp in each thread's graph
+    state. For a pipeline with no progress record yet, mark every log written up to that
+    time as done, so upgrading does not index the same history twice. Does nothing once
+    the progress records exist.
+    """
+    async with aiosqlite.connect(MEMORY_DB) as db:
+        await db.execute(HUMAN_LOGS_SCHEMA)
+        await db.execute(MEMORY_PROGRESS_SCHEMA)
+        last_log_id = 0
+        if processed_until:
+            async with db.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM human_logs WHERE timestamp <= ?",
+                (datetime.fromtimestamp(processed_until).isoformat(),),
+            ) as cursor:
+                last_log_id = (await cursor.fetchone())[0]
+        for pipeline in MEMORY_PIPELINES:
+            await db.execute(
+                "INSERT OR IGNORE INTO memory_progress (pipeline, last_log_id, updated_at) VALUES (?, ?, ?)",
+                (pipeline, last_log_id, datetime.now().isoformat()),
+            )
+        await db.commit()
+
+
+async def has_pending_memory(logged_before: datetime | None = None) -> bool:
+    """True if some pipeline has logs it has not stored yet.
+
+    logged_before: only count logs written before this time (e.g. before today).
+    """
+    async with aiosqlite.connect(MEMORY_DB) as db:
+        progress = [await get_memory_progress(db, p) for p in MEMORY_PIPELINES]
+        query = "SELECT 1 FROM human_logs WHERE id > ?"
+        params = [min(progress)]
+        if logged_before is not None:
+            query += " AND timestamp < ?"
+            params.append(logged_before.isoformat())
+        async with db.execute(query + " LIMIT 1", params) as cursor:
+            return await cursor.fetchone() is not None
 
 
 def analyze_human_logs(
@@ -82,7 +226,7 @@ def analyze_human_logs(
                 f.write(f"MESSAGE: {message}\n")
                 messages.append(message)
 
-                # Metadata is stored as a stringified dict in your log_event code
+                # Metadata is a JSON string (older rows: a stringified dict)
                 if metadata and metadata != "{}":
                     f.write(f"METADATA: {metadata}\n")
 

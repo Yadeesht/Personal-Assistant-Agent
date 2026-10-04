@@ -6,6 +6,7 @@ os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
 
 import uuid
 import re
+import threading
 import aiosqlite
 from pathlib import Path
 from datetime import datetime
@@ -23,9 +24,19 @@ MAX_CHUNK_TOKENS = (
 MAX_TIME_GAP_SECONDS = 3600
 
 from config.settings import EMBEDDING_GTE_MODEL_PATH, MEMORY_DB, EPISODIC_RAG_DB
-from utils.helper import setup_logger, count_tokens
+from utils.helper import count_tokens, first_line, load_sentence_model, setup_logger
 
 logger = setup_logger(__name__)
+
+COLLECTION_NAME = "episodic_chunks"
+
+# Memory is saved on a background thread while recall and the retrieval tool read from
+# other threads. The local Qdrant store allows one open client at a time, and a tokenizer
+# must not be used by two threads at once, so index access and embedding are serialized.
+# The embedding model is loaded once per process and shared by every EpisodicRAG.
+_STORE_LOCK = threading.RLock()
+_EMBED_LOCK = threading.RLock()
+_SHARED_MODEL = None
 
 
 class EpisodicRAG:
@@ -183,31 +194,69 @@ class EpisodicRAG:
 
     @property
     def model(self):
+        global _SHARED_MODEL
         if self._model is None:
-            try:
-                if not Path(EMBEDDING_GTE_MODEL_PATH).exists():
-                    self._model = SentenceTransformer("unsloth/gte-modernbert-base")
-                    self._model.save(EMBEDDING_GTE_MODEL_PATH)
-                self._model = SentenceTransformer(EMBEDDING_GTE_MODEL_PATH)
-
-                logger.info("gte-modernbert-base model loaded successfully.")
-            except Exception as e:
-                logger.info(f"Error loading gte-modernbert-base model: {e}")
-                raise e
+            with _EMBED_LOCK:
+                if _SHARED_MODEL is None:
+                    try:
+                        _SHARED_MODEL = load_sentence_model(
+                            EMBEDDING_GTE_MODEL_PATH, "unsloth/gte-modernbert-base"
+                        )
+                        logger.info("gte-modernbert-base model loaded successfully.")
+                    except Exception as e:
+                        logger.error(
+                            f"Could not load the episodic embedding model: {first_line(e)}"
+                        )
+                        raise
+                self._model = _SHARED_MODEL
         return self._model
+
+    def has_chunks(self) -> bool:
+        """True if the index holds any chunk (checked without loading the model)."""
+        with _STORE_LOCK:
+            client = QdrantClient(path=EPISODIC_RAG_DB)
+            try:
+                return (
+                    client.collection_exists(COLLECTION_NAME)
+                    and client.count(COLLECTION_NAME).count > 0
+                )
+            finally:
+                client.close()
 
     def _embedding_chunk(self, chunk):
         try:
             content = chunk["content"] if isinstance(chunk, dict) else chunk
-            embedding = self.model.encode(content, show_progress_bar=False)
+            model = self.model
+            with _EMBED_LOCK:
+                embedding = model.encode(content, show_progress_bar=False)
             return embedding / np.linalg.norm(embedding)
         except Exception as e:
-            logger.error(f"Error generating embedding: {e}")
+            logger.error(f"Error generating embedding: {first_line(e)}")
             return None
 
-    async def custom_text_splitters(self, past_summary_date=None):
+    async def custom_text_splitters(self, past_summary_date=None, log_id_range=None):
+        """Turn human_logs rows into embedded, linked chunks.
+
+        log_id_range: (after_id, up_to_id) selects rows by id, which is how the memory
+        progress table tracks what is stored; errors are raised so the caller does not
+        mark the rows as done. Without it, rows after past_summary_date are used and
+        errors return [].
+        """
         try:
-            if not past_summary_date:
+            filters = """
+                AND actor NOT IN ('supervisor_routing', 'summerizer_node')
+                AND COALESCE(json_extract(metadata, '$.type'), '') != 'tool_call'
+            """
+            if log_id_range is not None:
+                query = f"""
+                    SELECT timestamp, actor, message, metadata, thread_id
+                    FROM human_logs
+                    WHERE id > ? AND id <= ?
+                    {filters}
+                    ORDER BY id ASC
+                """
+                params = tuple(log_id_range)
+            elif not past_summary_date:
                 logger.warning(
                     "Past summary date is not set. No data will be retrieved."
                 )
@@ -218,17 +267,17 @@ class EpisodicRAG:
                 ).isoformat()
                 logger.info(f"Last summary date set to: {past_summary_date}")
 
-            query = """
-                SELECT timestamp, actor, message, metadata
-                FROM human_logs 
-                WHERE timestamp > ? 
-                AND actor NOT IN ('supervisor_routing', 'summerizer_node')
-                AND COALESCE(json_extract(metadata, '$.type'), '') != 'tool_call'
-                ORDER BY timestamp ASC
-            """
+                query = f"""
+                    SELECT timestamp, actor, message, metadata, thread_id
+                    FROM human_logs
+                    WHERE timestamp > ?
+                    {filters}
+                    ORDER BY timestamp ASC
+                """
+                params = (past_summary_date,)
 
             async with aiosqlite.connect(self.path) as db:
-                async with db.execute(query, (past_summary_date,)) as cursor:
+                async with db.execute(query, params) as cursor:
                     rows = await cursor.fetchall()
                     logger.info(f"Processing {len(rows)} raw logs...")
 
@@ -241,12 +290,30 @@ class EpisodicRAG:
             current_start_ts = None
             current_ts_obj = None
             actors = set()
+            current_thread = None
 
-            for timestamp, actor, message, _metadata in rows:
+            for timestamp, actor, message, _metadata, thread_id in rows:
                 try:
                     ts_obj = datetime.fromisoformat(timestamp)
                 except ValueError:
                     continue
+
+                # An episode never spans two threads.
+                if thread_id != current_thread:
+                    if current_lines:
+                        episodes.append(
+                            {
+                                "ts_obj": current_ts_obj,
+                                "timestamp": current_start_ts,
+                                "lines": current_lines,
+                                "actors": list(actors),
+                                "thread_id": current_thread,
+                            }
+                        )
+                    current_lines = []
+                    current_start_ts = None
+                    actors = set()
+                    current_thread = thread_id
 
                 if actor == "Human_node":
                     if current_lines:
@@ -256,6 +323,7 @@ class EpisodicRAG:
                                 "timestamp": current_start_ts,
                                 "lines": current_lines,
                                 "actors": list(actors),
+                                "thread_id": current_thread,
                             }
                         )
                     current_lines = [f"User: {message}"]
@@ -273,6 +341,7 @@ class EpisodicRAG:
                                 "timestamp": current_start_ts,
                                 "lines": current_lines,
                                 "actors": list(actors),
+                                "thread_id": current_thread,
                             }
                         )
                         current_lines = []
@@ -290,6 +359,7 @@ class EpisodicRAG:
                         "timestamp": current_start_ts,
                         "lines": current_lines,
                         "actors": list(actors),
+                        "thread_id": current_thread,
                     }
                 )
 
@@ -334,7 +404,12 @@ class EpisodicRAG:
                     except (ValueError, TypeError):
                         time_gap = 999999
 
-                    if time_gap < MAX_TIME_GAP_SECONDS and last_chunk:
+                    if (
+                        time_gap < MAX_TIME_GAP_SECONDS
+                        and last_chunk
+                        and last_chunk["metadata"].get("thread_id")
+                        == episode.get("thread_id")
+                    ):
                         current_last_tokens = count_tokens(last_chunk["content"])
 
                         if current_last_tokens + ep_tokens <= MAX_CHUNK_TOKENS:
@@ -359,6 +434,7 @@ class EpisodicRAG:
                                     "part": 1,
                                     "total_parts": 1,
                                     "actors": current_actors,
+                                    "thread_id": episode.get("thread_id"),
                                 },
                             }
                         )
@@ -368,6 +444,8 @@ class EpisodicRAG:
                         chunks = self._split_text_to_chunks(
                             episode["lines"], episode["timestamp"], current_actors
                         )
+                        for chunk in chunks:
+                            chunk["metadata"]["thread_id"] = episode.get("thread_id")
                         final_chunks.extend(chunks)
                     else:
                         task_uuid = str(uuid.uuid4())
@@ -382,6 +460,7 @@ class EpisodicRAG:
                                     "part": 1,
                                     "total_parts": 1,
                                     "actors": current_actors,
+                                    "thread_id": episode.get("thread_id"),
                                 },
                             }
                         )
@@ -392,6 +471,8 @@ class EpisodicRAG:
                 final_chunks[i]["embedding"] = self._embedding_chunk(
                     final_chunks[i]["content"]
                 )
+                if final_chunks[i]["embedding"] is None and log_id_range is not None:
+                    raise RuntimeError("could not embed the conversation chunks")
 
                 try:
                     curr_ts = datetime.fromisoformat(
@@ -405,7 +486,10 @@ class EpisodicRAG:
                         prev_ts = datetime.fromisoformat(
                             final_chunks[i - 1]["metadata"]["timestamp"]
                         )
-                        if (curr_ts - prev_ts).total_seconds() < MAX_TIME_GAP_SECONDS:
+                        if (curr_ts - prev_ts).total_seconds() < MAX_TIME_GAP_SECONDS and (
+                            final_chunks[i - 1]["metadata"].get("thread_id")
+                            == final_chunks[i]["metadata"].get("thread_id")
+                        ):
                             final_chunks[i]["metadata"]["prev_id"] = final_chunks[
                                 i - 1
                             ]["id"]
@@ -417,7 +501,10 @@ class EpisodicRAG:
                         next_ts = datetime.fromisoformat(
                             final_chunks[i + 1]["metadata"]["timestamp"]
                         )
-                        if (next_ts - curr_ts).total_seconds() < MAX_TIME_GAP_SECONDS:
+                        if (next_ts - curr_ts).total_seconds() < MAX_TIME_GAP_SECONDS and (
+                            final_chunks[i + 1]["metadata"].get("thread_id")
+                            == final_chunks[i]["metadata"].get("thread_id")
+                        ):
                             final_chunks[i]["metadata"]["next_id"] = final_chunks[
                                 i + 1
                             ]["id"]
@@ -430,9 +517,20 @@ class EpisodicRAG:
             return final_chunks
         except Exception as e:
             logger.error(f"Error during custom text splitting: {e}")
+            if log_id_range is not None:
+                raise
             return []
 
     def index_creation(self, final_chunks):
+        """Store chunks in the index. Returns True on success."""
+        with _STORE_LOCK:
+            return self._index_creation(final_chunks)
+
+    def retrieve_chunks(self, query, conditions=None, top_k=5):
+        with _STORE_LOCK:
+            return self._retrieve_chunks(query, conditions, top_k)
+
+    def _index_creation(self, final_chunks):
         client = None
         try:
             client = QdrantClient(path=EPISODIC_RAG_DB)
@@ -461,6 +559,7 @@ class EpisodicRAG:
                     "actors": chunk["metadata"]["actors"],
                     "prev_id": chunk["metadata"]["prev_id"],
                     "next_id": chunk["metadata"]["next_id"],
+                    "thread_id": chunk["metadata"].get("thread_id"),
                 }
 
                 points.append(
@@ -472,14 +571,16 @@ class EpisodicRAG:
                 )
 
             client.upsert(collection_name=collection_name, points=points)
+            return True
 
         except Exception as e:
             logger.error(f"Error during index creation: {e}")
+            return False
         finally:
             if client is not None:
                 client.close()
 
-    def retrieve_chunks(self, query, conditions=None, top_k=5):
+    def _retrieve_chunks(self, query, conditions=None, top_k=5):
         client = None
         try:
             if conditions is None:
@@ -513,7 +614,21 @@ class EpisodicRAG:
                     )
                 )
 
-            query_filter = models.Filter(must=must) if must else None
+            # Leave out one thread's chunks, e.g. the conversation already in context.
+            must_not = []
+            if conditions.get("exclude_thread_id"):
+                must_not.append(
+                    models.FieldCondition(
+                        key="thread_id",
+                        match=models.MatchValue(value=str(conditions["exclude_thread_id"])),
+                    )
+                )
+
+            query_filter = (
+                models.Filter(must=must or None, must_not=must_not or None)
+                if must or must_not
+                else None
+            )
 
             search_result = client.query_points(
                 collection_name="episodic_chunks",
@@ -556,6 +671,10 @@ class EpisodicRAG:
                             "context": full_context,
                             "score": score,
                             "type": "reconstructed_task",
+                            # When it was discussed and in which chat, so "when did we
+                            # talk about X" can be answered.
+                            "timestamp": chunk.get("timestamp"),
+                            "thread_id": chunk.get("thread_id"),
                         }
                     )
 
@@ -592,6 +711,10 @@ class EpisodicRAG:
                             "context": "\n".join(context_block),
                             "score": score,
                             "type": "expanded_chunk",
+                            # When it was discussed and in which chat, so "when did we
+                            # talk about X" can be answered.
+                            "timestamp": chunk.get("timestamp"),
+                            "thread_id": chunk.get("thread_id"),
                         }
                     )
                     seen_ids.add(hit.id)
@@ -602,6 +725,10 @@ class EpisodicRAG:
                             "context": chunk["content"],
                             "score": score,
                             "type": "raw_chunk",
+                            # When it was discussed and in which chat, so "when did we
+                            # talk about X" can be answered.
+                            "timestamp": chunk.get("timestamp"),
+                            "thread_id": chunk.get("thread_id"),
                         }
                     )
                     seen_ids.add(hit.id)

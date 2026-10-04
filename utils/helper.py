@@ -1,4 +1,7 @@
 import logging
+import logging.handlers
+import os
+import shutil
 import sqlite3
 import sys
 import tiktoken
@@ -14,7 +17,10 @@ import asyncio
 import json
 import unicodedata
 import aiosqlite
+from pathlib import Path
+
 from config.settings import CHECKPOINT_DB
+from config.settings import DATA_DIR
 from config.settings import DEFAULT_THREAD_ID
 
 
@@ -95,6 +101,19 @@ except Exception:
 console = Console()
 
 
+# Threads that work in the background while the user types (memory saving, model
+# preloading) are named with this prefix. Their routine messages would land in the
+# middle of the input prompt, so the console shows only their warnings and errors;
+# everything they log goes to data/logs/memory.log.
+BACKGROUND_THREAD_PREFIX = "memory-"
+# MEMORY_LOG_FILE overrides the location (the tests point it at a temp file).
+BACKGROUND_LOG_FILE = Path(os.getenv("MEMORY_LOG_FILE") or DATA_DIR / "logs" / "memory.log")
+
+
+def _from_background_thread(record: logging.LogRecord) -> bool:
+    return (record.threadName or "").startswith(BACKGROUND_THREAD_PREFIX)
+
+
 def setup_logger(name: str = __name__) -> logging.Logger:
     """Configure and return a logger instance with clean Rich formatting"""
     root_logger = logging.getLogger()
@@ -110,9 +129,58 @@ def setup_logger(name: str = __name__) -> logging.Logger:
             omit_repeated_times=False,
         )
         handler.setFormatter(logging.Formatter("%(message)s", datefmt="[%X]"))
+        handler.addFilter(
+            lambda r: r.levelno >= logging.WARNING or not _from_background_thread(r)
+        )
         root_logger.addHandler(handler)
+
+        try:
+            BACKGROUND_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            file_handler = logging.handlers.RotatingFileHandler(
+                BACKGROUND_LOG_FILE, maxBytes=1_000_000, backupCount=3, encoding="utf-8"
+            )
+            file_handler.setFormatter(
+                logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+            )
+            file_handler.addFilter(_from_background_thread)
+            root_logger.addHandler(file_handler)
+        except OSError as e:
+            root_logger.warning(f"Background log file unavailable: {e}")
+
         root_logger.setLevel(logging.INFO)
     return logging.getLogger(name)
+
+
+def first_line(error: Exception, limit: int = 300) -> str:
+    """The first line of an error message, for logs (some library errors run to pages)."""
+    text = str(error).strip().splitlines()[0] if str(error).strip() else type(error).__name__
+    return text[:limit]
+
+
+def load_sentence_model(local_path, hub_name: str):
+    """Load a sentence-transformers model from local_path, getting it from the
+    Hugging Face hub (or its local cache) and saving it there first if needed.
+
+    The model is saved into a temporary folder that is renamed into place only when
+    complete, so a run stopped mid-save cannot leave a half-written model behind. A
+    folder without modules.json (e.g. left by an older, interrupted save) is rebuilt.
+    """
+    from sentence_transformers import SentenceTransformer
+
+    local_path = Path(local_path)
+    if (local_path / "modules.json").exists():
+        return SentenceTransformer(str(local_path))
+
+    logging.getLogger(__name__).info(
+        f"Saving embedding model {hub_name} to {local_path} (one time)."
+    )
+    model = SentenceTransformer(hub_name)
+    partial = local_path.with_name(local_path.name + ".partial")
+    shutil.rmtree(partial, ignore_errors=True)
+    model.save(str(partial))
+    shutil.rmtree(local_path, ignore_errors=True)
+    os.replace(partial, local_path)
+    return model
 
 
 class RequestTracker:

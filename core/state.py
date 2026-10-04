@@ -1,14 +1,12 @@
-import time
 from datetime import datetime
 from typing import Annotated, Optional, List, Dict, Any
 
-import aiosqlite
+from langchain_core.messages import HumanMessage
 from langgraph.graph.message import add_messages
 from pydantic import BaseModel
 from typing_extensions import TypedDict
 from utils.helper import setup_logger, count_tokens
-
-from config.settings import MEMORY_DB
+from utils.memory_manager import has_pending_memory
 
 logger = setup_logger(__name__)
 
@@ -31,8 +29,90 @@ class State(TypedDict):
     summary: Optional[str]
     last_memory_timestamp: Optional[float]
     last_knowledgegraph_timestamp: Optional[float]
+    # Long-term memory recalled for the user's latest message, looked up once per turn
+    # and shared by the supervisor and workers (recalled_for = that message's id).
+    recalled_memory: Optional[str]
+    recalled_for: Optional[str]
     next: Optional[str]
     current_agent: Annotated[Optional[str], last_value]
+
+
+# Every message list the summarizer looks after: the shared one and each agent's own.
+MESSAGE_CHANNELS = (
+    "messages",
+    "supervisor_messages",
+    "communication_messages",
+    "planning_messages",
+    "document_messages",
+    "presentation_messages",
+    "data_messages",
+    "code_messages",
+)
+
+# Agents a turn can resume in directly: a worker that asked the user something, or the
+# code agent waiting for approval of the code it wrote.
+RESUMABLE_AGENTS = (
+    "communication_agent",
+    "planning_agent",
+    "document_agent",
+    "presentation_agent",
+    "data_agent",
+    "code_agent",
+)
+
+# Short-term memory: a message list over SUMMARY_TRIGGER_TOKENS has its older turns
+# condensed into the thread summary, keeping about SUMMARY_KEEP_TOKENS of the newest.
+SUMMARY_TRIGGER_TOKENS = 150000
+SUMMARY_KEEP_TOKENS = 20000
+
+
+def plan_summary(state) -> dict:
+    """Which old messages to archive, per message list: {channel: [messages]}.
+
+    Only lists over SUMMARY_TRIGGER_TOKENS are condensed. A list is cut only right before
+    a HumanMessage (the user's message, or a handoff between agents): no tool call is
+    waiting for its result there, so a tool call is never separated from its result.
+    Each list keeps its newest turns up to SUMMARY_KEEP_TOKENS, and always the whole
+    turn in progress. Empty when nothing needs condensing.
+    """
+    plan = {}
+    for channel in MESSAGE_CHANNELS:
+        messages = state.get(channel) or []
+        if not messages:
+            continue
+        tokens = [count_tokens([m]) for m in messages]
+        if sum(tokens) <= SUMMARY_TRIGGER_TOKENS:
+            continue
+        cut_points = [
+            i for i, m in enumerate(messages) if i > 0 and isinstance(m, HumanMessage)
+        ]
+        if not cut_points:
+            continue
+        keep_from = cut_points[-1]
+        for i in reversed(cut_points):
+            if sum(tokens[i:]) > SUMMARY_KEEP_TOKENS:
+                break
+            keep_from = i
+        plan[channel] = messages[:keep_from]
+    return plan
+
+
+def route_to_active_agent(state) -> str:
+    """The agent that should handle the user's message: the worker or code agent the
+    user is talking to, otherwise the supervisor."""
+    current_agent = state.get("current_agent")
+    if current_agent in RESUMABLE_AGENTS:
+        logger.info(f"🔄 Resuming conversation in active agent context: {current_agent}")
+        return current_agent
+    return "supervisor"
+
+
+def route_after_memory(state) -> str:
+    """After the memory step: condense the thread if it has grown too long, then hand
+    the message to the active agent."""
+    if plan_summary(state):
+        return "summerizer_node"
+    return route_to_active_agent(state)
 
 
 class TaskSpec(BaseModel):
@@ -133,67 +213,22 @@ def internal_agent_route(state: State) -> str:
 
 
 async def route_start(state: State) -> str:
-
+    # Long-term memory is saved on /new, /thread, exit and at startup (main.py). A session
+    # that runs past midnight also saves the earlier day's logs here, at most once a day
+    # per thread so a failing pipeline is not retried on every turn.
+    start_of_today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
     last_memory_ts = state.get("last_memory_timestamp")
+    tried_today = (
+        isinstance(last_memory_ts, (int, float))
+        and datetime.fromtimestamp(last_memory_ts) >= start_of_today
+    )
 
-    if isinstance(last_memory_ts, float):
-        query_ts = datetime.fromtimestamp(last_memory_ts).isoformat()
+    if not tried_today:
+        try:
+            if await has_pending_memory(logged_before=start_of_today):
+                logger.info("📅 New Day Detected: saving earlier logs to long-term memory.")
+                return "memory_update_node"
+        except Exception as e:
+            logger.error(f"Long-term memory check failed: {e}")
 
-    elif isinstance(last_memory_ts, datetime):
-        query_ts = last_memory_ts.isoformat()
-
-    else:
-        query_ts = str(last_memory_ts)
-
-    should_update_memory = False
-
-    if last_memory_ts is None:
-        logger.info("🆕 New Thread Detected: Initializing memory timestamp.")
-        should_update_memory = True
-    else:
-        now_float = time.time()
-        SECONDS_IN_DAY = 86400
-        IST_OFFSET = 19800
-
-        current_day_ist = int((now_float + IST_OFFSET) // SECONDS_IN_DAY)
-        memory_day_ist = int((last_memory_ts + IST_OFFSET) // SECONDS_IN_DAY)
-
-        if current_day_ist > memory_day_ist:
-            logger.info("📅 New Day Detected: Triggering memory optimization.")
-            query = """
-                SELECT timestamp, actor, message, metadata
-                FROM human_logs
-                WHERE timestamp > ?
-                AND actor NOT IN ('supervisor_routing', 'summerizer_node')
-                AND COALESCE(json_extract(metadata, '$.type'), '') != 'tool_call'
-                ORDER BY timestamp ASC
-            """
-            async with aiosqlite.connect(MEMORY_DB) as db:
-                async with db.execute(query, (query_ts,)) as cursor:
-                    rows = await cursor.fetchall()
-                    logger.info(f"Processing {len(rows)} raw logs...")
-            if len(rows) > 0:
-                should_update_memory = True
-
-    if should_update_memory:
-        return "memory_update_node"
-
-    messages = state["messages"]
-
-    if count_tokens(messages) > 8000:
-        return "summerizer_node"
-
-    # Direct agent resume or fallback to supervisor
-    current_agent = state.get("current_agent")
-    if current_agent in [
-        "communication_agent",
-        "planning_agent",
-        "document_agent",
-        "presentation_agent",
-        "data_agent",
-        "code_agent",
-    ]:
-        logger.info(f"🔄 Resuming conversation in active agent context: {current_agent}")
-        return current_agent
-
-    return "supervisor"
+    return route_after_memory(state)
