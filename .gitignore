@@ -17,3 +17,6 @@
 **/dummy.txt
 **/log_details.txt
 **/checkpoint_text_dump.txt
+
+# Redrawn from your own memory after every save, so it shows personal facts.
+docs/images/knowledge_graph.png

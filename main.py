@@ -297,13 +297,6 @@ async def main():
             checkpointer = AsyncSqliteSaver(connection)
             graph = build_graph(tool_sets, checkpointer)
 
-            # g = graph.get_graph()
-
-            # png_bytes = g.draw_mermaid_png()
-
-            # with open("docs/images/agent_structure_graph.png", "wb") as f:
-            #     f.write(png_bytes)
-
             current_thread_id = str(DEFAULT_THREAD_ID)
             # LangGraph's default recursion limit (25 steps) ends long multi-app tasks with an error;
             # 310 matches the eval (3 graph steps per model call x 100 calls + 10).
