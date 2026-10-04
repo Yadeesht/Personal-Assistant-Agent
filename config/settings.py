@@ -34,6 +34,23 @@ MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4.1-mini")
 MAX_RETRIES = 3
 REQUEST_TIMEOUT = 30
 
+# Per-model request options, set in .env only for models that need them.
+# MODEL_TEMPERATURE: some models accept only their default (gpt-6-luna: 1). Unset = the
+#   client default (0.7).
+# MODEL_TOOL_REASONING_EFFORT: reasoning effort for calls that offer tools. gpt-6-luna
+#   rejects tools on Chat Completions unless this is "none". Leave unset for models
+#   without reasoning (gpt-4.1-mini rejects the parameter). Calls without tools
+#   (summarizer, knowledge-graph extraction) keep the model's default reasoning.
+MODEL_TEMPERATURE = (
+    float(os.getenv("MODEL_TEMPERATURE")) if os.getenv("MODEL_TEMPERATURE") else None
+)
+MODEL_TOOL_REASONING_EFFORT = os.getenv("MODEL_TOOL_REASONING_EFFORT") or None
+
+# Tools that act outside the app and cannot be undone. Before one runs, the app pauses
+# and shows the user exactly what it would do; it runs only if they type yes
+# (core/confirm.py). Calendar invites (create_event with attendees) could be added here.
+CONFIRM_BEFORE_TOOLS = {"send_email"}
+
 # -----------------------------------------------------------------------------
 # Embedding model paths
 # -----------------------------------------------------------------------------
@@ -48,3 +65,15 @@ TOKEN_STRATEGY = "last"
 
 # Default thread for terminal-based sessions
 DEFAULT_THREAD_ID = os.getenv("DEFAULT_THREAD_ID", "default_thread")
+
+# -----------------------------------------------------------------------------
+# Long-term memory
+# -----------------------------------------------------------------------------
+# Look up related knowledge-graph facts and past conversations for every user message
+# and show them to the agents. Set MEMORY_RECALL=false to turn it off (e.g. for evals).
+MEMORY_RECALL = os.getenv("MEMORY_RECALL", "true").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
