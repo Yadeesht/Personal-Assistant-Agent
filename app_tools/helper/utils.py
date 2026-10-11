@@ -1,4 +1,5 @@
 import io
+import re
 import zipfile
 import xml.etree.ElementTree as ET
 
@@ -30,7 +31,11 @@ def extract_office_xml_text(file_bytes: bytes, mime_type: str) -> Optional[str]:
                 mime_type
                 == "application/vnd.openxmlformats-officedocument.presentationml.presentation"
             ):
-                targets = [n for n in zf.namelist() if n.startswith("ppt/slides/slide")]
+                # Slide order, not name order (slide10.xml would sort before slide2.xml).
+                targets = sorted(
+                    (n for n in zf.namelist() if re.fullmatch(r"ppt/slides/slide\d+\.xml", n)),
+                    key=lambda n: int(re.search(r"(\d+)\.xml$", n).group(1)),
+                )
             elif (
                 mime_type
                 == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"

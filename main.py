@@ -74,6 +74,24 @@ AGENT_MESSAGE_KEY = {
 }
 
 
+# Commands that also work typed without the slash, but only as the whole message.
+BARE_COMMANDS = {
+    "exit", "quit", "bye", "clear", "cls", "new", "reset", "reload", "thread", "help",
+}
+
+
+def parse_command(query: str) -> tuple:
+    """(command, argument) for a typed line; ("", "") when it is a message for the
+    assistant. A bare command word only counts on its own: "new meeting with Bob at 5"
+    or "help me write an email" is a message, not /new or /help."""
+    parts = query.strip().split(maxsplit=1)
+    cmd = parts[0].lower() if parts else ""
+    arg = parts[1].strip() if len(parts) > 1 else ""
+    if not cmd.startswith("/") and (arg or cmd not in BARE_COMMANDS):
+        return "", ""
+    return cmd, arg
+
+
 def next_thread_id(current_id: str) -> str:
     """Increment thread ID: '7' -> '8', 'thread_1' -> 'thread_2', etc."""
     current_id = str(current_id).strip()
@@ -352,10 +370,7 @@ async def main():
                 try:
 
                     agent_state["last_interaction"] = time.time()
-                    query_clean = query.strip()
-                    cmd_parts = query_clean.split(maxsplit=1)
-                    cmd = cmd_parts[0].lower() if cmd_parts else ""
-                    cmd_arg = cmd_parts[1].strip() if len(cmd_parts) > 1 else ""
+                    cmd, cmd_arg = parse_command(query)
 
                     if cmd in ["exit", "quit", "bye", "/exit", "/quit"]:
                         await finish_saving_memory()

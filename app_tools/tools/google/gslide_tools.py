@@ -120,12 +120,19 @@ async def get_presentation(presentation_id: str) -> str:
             status="error", message="", error=error_msg
         ).model_dump_json(indent=2)
 
-    service = get_service()
     logger.info(f"[get_presentation] Invoked. ID: '{request.presentation_id}'")
 
-    result = await asyncio.to_thread(
-        service.presentations().get(presentationId=request.presentation_id).execute
-    )
+    try:
+        service = get_service()
+        result = await asyncio.to_thread(
+            service.presentations().get(presentationId=request.presentation_id).execute
+        )
+    except Exception as error:
+        error_msg = f"Error getting presentation: {str(error)}"
+        logger.error(f"[get_presentation] {error_msg}")
+        return GetPresentationResponse(
+            status="error", message="", error=error_msg
+        ).model_dump_json(indent=2)
 
     title = result.get("title", "Untitled")
     slides = result.get("slides", [])

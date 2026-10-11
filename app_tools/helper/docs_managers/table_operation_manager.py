@@ -70,24 +70,30 @@ class TableOperationManager:
         cols = len(table_data[0])
 
         try:
+            # The new table's position among the document's tables: tables that start
+            # before the insertion point stay ahead of it. (It is not always the last
+            # table: inserting above an existing table puts it first.)
+            existing_tables = await self._get_document_tables(document_id)
+            table_position = sum(1 for t in existing_tables if t["start_index"] < index)
+
             # Step 1: Create empty table
             await self._create_empty_table(document_id, index, rows, cols)
 
             # Step 2: Get fresh document structure to find actual cell positions
             fresh_tables = await self._get_document_tables(document_id)
-            if not fresh_tables:
+            if len(fresh_tables) <= table_position:
                 return False, "Could not find table after creation", {}
 
             # Step 3: Populate each cell with proper index refreshing
             population_count = await self._populate_table_cells(
-                document_id, table_data, bold_headers
+                document_id, table_data, bold_headers, table_position
             )
 
             metadata = {
                 "rows": rows,
                 "columns": cols,
                 "populated_cells": population_count,
-                "table_index": len(fresh_tables) - 1,
+                "table_index": table_position,
             }
 
             return (
@@ -123,7 +129,11 @@ class TableOperationManager:
         return find_tables(doc)
 
     async def _populate_table_cells(
-        self, document_id: str, table_data: List[List[str]], bold_headers: bool
+        self,
+        document_id: str,
+        table_data: List[List[str]],
+        bold_headers: bool,
+        table_position: int = -1,
     ) -> int:
         """
         Populate table cells with data, refreshing structure after each insertion.
@@ -148,6 +158,7 @@ class TableOperationManager:
                         col_idx,
                         cell_text,
                         bold_headers and row_idx == 0,
+                        table_position,
                     )
 
                     if success:
@@ -170,6 +181,7 @@ class TableOperationManager:
         col_idx: int,
         cell_text: str,
         apply_bold: bool = False,
+        table_position: int = -1,
     ) -> bool:
         """
         Populate a single cell with text, with optional bold formatting.
@@ -182,7 +194,9 @@ class TableOperationManager:
             if not tables:
                 return False
 
-            table = tables[-1]  # Use the last table (newly created one)
+            if table_position >= len(tables):
+                return False
+            table = tables[table_position]  # the newly created table
             cells = table.get("cells", [])
 
             # Bounds checking

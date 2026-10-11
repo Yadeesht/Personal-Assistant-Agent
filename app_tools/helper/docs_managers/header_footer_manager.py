@@ -130,37 +130,29 @@ class HeaderFooterManager:
         """
         if section_type == "header":
             sections = doc.get("headers", {})
+            id_fields = {
+                "DEFAULT": "defaultHeaderId",
+                "FIRST_PAGE": "firstPageHeaderId",
+                "FIRST_PAGE_ONLY": "firstPageHeaderId",
+                "EVEN_PAGE": "evenPageHeaderId",
+            }
         else:
             sections = doc.get("footers", {})
+            id_fields = {
+                "DEFAULT": "defaultFooterId",
+                "FIRST_PAGE": "firstPageFooterId",
+                "FIRST_PAGE_ONLY": "firstPageFooterId",
+                "EVEN_PAGE": "evenPageFooterId",
+            }
 
-        # Try to match section based on header_footer_type
-        # Google Docs API typically uses section IDs that correspond to types
-
-        # First, try to find an exact match based on common patterns
-        for section_id, section_data in sections.items():
-            # Check if section_data contains type information
-            if "type" in section_data and section_data["type"] == header_footer_type:
-                return section_data, section_id
-
-        # If no exact match, try pattern matching on section ID
-        # Google Docs often uses predictable section ID patterns
-        target_patterns = {
-            "DEFAULT": ["default", "kix"],  # DEFAULT headers often have these patterns
-            "FIRST_PAGE": ["first", "firstpage"],
-            "EVEN_PAGE": ["even", "evenpage"],
-            "FIRST_PAGE_ONLY": ["first", "firstpage"],  # Legacy support
-        }
-
-        patterns = target_patterns.get(header_footer_type, [])
-        for pattern in patterns:
-            for section_id, section_data in sections.items():
-                if pattern.lower() in section_id.lower():
-                    return section_data, section_id
-
-        # If still no match, return the first available section as fallback
-        # This maintains backward compatibility
-        for section_id, section_data in sections.items():
-            return section_data, section_id
+        # The document style names the header/footer used for each page type. Header
+        # IDs ("kix.abc123") say nothing about their type, so guessing from them (or
+        # taking the first one) could overwrite the default header when the first-page
+        # one was asked for.
+        id_field = id_fields.get(header_footer_type)
+        section_id = doc.get("documentStyle", {}).get(id_field) if id_field else None
+        if section_id and section_id in sections:
+            return sections[section_id], section_id
 
         return None, None
 

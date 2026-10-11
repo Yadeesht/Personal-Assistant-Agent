@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import re
 import webbrowser
 from datetime import datetime, timedelta
 from email import message_from_bytes
@@ -72,10 +73,55 @@ def decode_mime_header(header: str) -> str:
     decoded_string = ""
     for part, encoding in decoded_parts:
         if isinstance(part, bytes):
-            decoded_string += part.decode(encoding or "utf-8")
+            try:
+                decoded_string += part.decode(encoding or "utf-8", errors="replace")
+            except LookupError:  # unknown charset name, e.g. "unknown-8bit"
+                decoded_string += part.decode("utf-8", errors="replace")
         else:
             decoded_string += part
     return decoded_string
+
+
+def _decode_part(part) -> str:
+    """A MIME part's text, in its declared charset."""
+    payload = part.get_payload(decode=True)
+    if not payload:
+        return ""
+    charset = part.get_content_charset() or "utf-8"
+    try:
+        return payload.decode(charset, errors="replace")
+    except LookupError:
+        return payload.decode("utf-8", errors="replace")
+
+
+def _html_to_text(html_text: str) -> str:
+    """Readable text from an HTML email body (scripts and styles dropped)."""
+    text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", html_text)
+    text = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</tr>|</li>", "\n", text)
+    return re.sub(r"<[^>]+>", " ", text)
+
+
+def extract_email_body(mime_message) -> str:
+    """The body of an email: its text/plain part, or its HTML part as text when there
+    is no plain one. Attachments are skipped."""
+    if not mime_message.is_multipart():
+        body = _decode_part(mime_message)
+        if mime_message.get_content_type() == "text/html":
+            body = _html_to_text(body)
+        return body
+
+    html_body = ""
+    for part in mime_message.walk():
+        if part.is_multipart() or part.get_content_disposition() == "attachment":
+            continue
+        content_type = part.get_content_type()
+        if content_type == "text/plain":
+            body = _decode_part(part)
+            if body.strip():
+                return body
+        elif content_type == "text/html" and not html_body:
+            html_body = _decode_part(part)
+    return _html_to_text(html_body) if html_body else ""
 
 
 async def get_user_email(service) -> str:
@@ -109,8 +155,6 @@ async def send_email(recipient_id: str, subject: str, message: str) -> dict[str,
             success=False, error=f"Invalid parameters: {str(e)}"
         ).model_dump()
 
-    service = get_service()
-
     try:
         service = get_service()
         user_email = await get_user_email(service)
@@ -135,6 +179,9 @@ async def send_email(recipient_id: str, subject: str, message: str) -> dict[str,
 
     except HttpError as error:
         logger.error(f"Gmail API error: {error}")
+        return SendEmailResponse(success=False, error=str(error)).model_dump()
+    except Exception as error:
+        logger.error(f"Unexpected error: {error}")
         return SendEmailResponse(success=False, error=str(error)).model_dump()
 
 
@@ -183,7 +230,7 @@ async def get_unread_emails(date: int = 7, max_results: int = 20) -> dict[str, A
         request = UnreadEmailsRequest(date=date, max_results=max_results)
     except Exception as e:
         return UnreadEmailsResponse(
-            count=0, error=f"Invalid parameters: {str(e)}"
+            count=0, emails=[], error=f"Invalid parameters: {str(e)}"
         ).model_dump()
 
     try:
@@ -293,18 +340,7 @@ async def read_email(email_id: str) -> dict[str, Any]:
 
         mime_message = message_from_bytes(decoded_data)
 
-        body = None
-        if mime_message.is_multipart():
-            for part in mime_message.walk():
-                if part.get_content_type() == "text/plain":
-                    payload = part.get_payload(decode=True)
-                    if payload:
-                        body = payload.decode(errors="replace")
-                    break
-        else:
-            payload = mime_message.get_payload(decode=True)
-            if payload:
-                body = payload.decode(errors="replace")
+        body = extract_email_body(mime_message)
 
         logger.info(f"Email read: {request.email_id}")
 

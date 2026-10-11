@@ -629,8 +629,9 @@ async def modify_doc_text(
                     error=f"Error: {error_msg}",
                 ).model_dump()
 
-            # For formatting, we need end_index
-            if request.end_index is None:
+            # Formatting existing text needs its range. Inserted text is formatted
+            # over the inserted range, so end_index is optional then.
+            if request.end_index is None and request.text is None:
                 return ModifyDocTextResponse(
                     status="failed",
                     document_id=request.document_id,
@@ -639,8 +640,10 @@ async def modify_doc_text(
                     error="'end_index' is required when applying formatting.",
                 ).model_dump()
 
-            is_valid, error_msg = validator.validate_index_range(
-                request.start_index, request.end_index
+            is_valid, error_msg = (
+                validator.validate_index_range(request.start_index, request.end_index)
+                if request.end_index is not None
+                else (True, "")
             )
             if not is_valid:
                 return ModifyDocTextResponse(
@@ -910,7 +913,12 @@ async def insert_doc_elements(
         )
     except Exception as e:
         return InsertDocElementsResponse(
-            status="error", error=f"Invalid parameters: {str(e)}"
+            status="error",
+            document_id=str(document_id),
+            element_type=str(element_type),
+            index=index if isinstance(index, int) else 0,
+            web_view_link="",
+            error=f"Invalid parameters: {str(e)}",
         ).model_dump()
 
     try:
@@ -1242,7 +1250,7 @@ async def batch_update_doc(
     Args:
         document_id: ID of the document to update
         operations: List of operation dictionaries. Each operation should contain:
-                   - type: Operation type ('insert_text', 'delete_text', 'replace_text', 'format_text', 'insert_table', 'insert_page_break')
+                   - type: Operation type ('insert_text', 'delete_text', 'replace_text', 'format_text', 'insert_table', 'insert_page_break', 'find_replace' with find_text, replace_text, match_case)
                    - Additional parameters specific to each operation type
 
     Example operations:
@@ -1358,9 +1366,9 @@ async def inspect_doc_structure(
     except Exception as error:
         return InspectDocStructureResponse(
             status="error",
-            document_id=request.document_id,
+            document_id=str(document_id),
             structure={},
-            error=str(error),
+            error=f"Invalid parameters: {error}",
         ).model_dump()
 
     try:
@@ -1525,7 +1533,10 @@ async def create_table_with_data(
         logger.error(f"Request validation error: {e}")
         return CreateTableWithDataResponse(
             status="error",
-            document_id=document_id,
+            document_id=str(document_id),
+            rows=0,
+            columns=0,
+            web_view_link="",
             error=f"Invalid request parameters: {str(e)}",
         ).model_dump()
 

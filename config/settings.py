@@ -35,8 +35,8 @@ MAX_RETRIES = 3
 REQUEST_TIMEOUT = 30
 
 # Per-model request options, set in .env only for models that need them.
-# MODEL_TEMPERATURE: some models accept only their default (gpt-6-luna: 1). Unset = the
-#   client default (0.7).
+# MODEL_TEMPERATURE: some models accept only their default (gpt-6-luna: 1). Unset = no
+#   temperature is sent, so the model's own default applies.
 # MODEL_TOOL_REASONING_EFFORT: reasoning effort for calls that offer tools. gpt-6-luna
 #   rejects tools on Chat Completions unless this is "none". Leave unset for models
 #   without reasoning (gpt-4.1-mini rejects the parameter). Calls without tools

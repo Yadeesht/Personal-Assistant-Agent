@@ -247,16 +247,15 @@ async def search_custom_siterestrict(
     Returns:
         str: Formatted search results from the specified sites.
     """
-    service = get_service()
     logger.info(f"[search_custom_siterestrict] Invoked. Query: '{q}', Sites: {sites}")
 
     # Build site restriction query
     site_query = " OR ".join([f"site:{site}" for site in sites])
     full_query = f"{q} ({site_query})"
 
-    # Use the main search function with the modified query
+    # Use the main search function with the modified query (it gets its own service;
+    # it has no `service` parameter, so passing one made every call fail).
     return await search_custom(
-        service=service,
         q=full_query,
         num=num,
         start=start,

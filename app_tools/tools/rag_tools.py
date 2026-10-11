@@ -1,6 +1,7 @@
 from rag.knowledge_graph import KnowledgeGraph
 from rag.episodic_rag import EpisodicRAG
 import sys
+import json
 import functools
 import threading
 from datetime import datetime
@@ -240,8 +241,10 @@ async def retrieve_from_knowledge_graph(query: str):
     try:
         kg = get_kg_instance()
         results = await asyncio.to_thread(kg.find_similar_with_expansion, query)
-        await asyncio.to_thread(kg.visualize)
-        return results
+        # Plain records: a DataFrame turned into text hides most of its columns.
+        if results is None or getattr(results, "empty", False):
+            return "No matching entities found in the knowledge graph."
+        return json.loads(results.to_json(orient="records"))
     except Exception as e:
         logger.error(f"Error retrieving from knowledge graph: {e}")
         return f"Error retrieving from knowledge graph: {e}"
@@ -306,7 +309,10 @@ async def retrieve_relevant_chunks(query: str, top_k: int = 5, conditions: dict 
     try:
         rag = get_rag_instance()
         results = await asyncio.to_thread(rag.retrieve_chunks, query, conditions, top_k)
-
+        if results is None:
+            return "Could not search past conversations (nothing stored yet, or the search failed)."
+        if not results:
+            return "No past conversations matched."
         return results
     except Exception as e:
         logger.error(f"Error retrieving relevant chunks: {e}")

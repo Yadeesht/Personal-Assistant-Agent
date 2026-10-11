@@ -47,6 +47,7 @@ logger = setup_logger(__name__)
 
 LIST_TASKS_MAX_RESULTS_DEFAULT = 20
 LIST_TASKS_MAX_RESULTS_MAX = 10_000
+LIST_TASKS_PAGE_MAX = 100  # the Tasks API's limit per page
 LIST_TASKS_MAX_POSITION = "99999999999999999999"
 
 
@@ -455,7 +456,8 @@ async def list_tasks(
     try:
         params: Dict[str, Any] = {"tasklist": request.task_list_id}
         if request.max_results is not None:
-            params["maxResults"] = request.max_results
+            # One page holds at most 100 tasks; more are fetched page by page below.
+            params["maxResults"] = min(request.max_results, LIST_TASKS_PAGE_MAX)
         if request.page_token:
             params["pageToken"] = request.page_token
         if request.show_completed is not None:
@@ -499,7 +501,7 @@ async def list_tasks(
         results_remaining -= len(tasks)
         while results_remaining > 0 and next_page_token:
             params["pageToken"] = next_page_token
-            params["maxResults"] = str(results_remaining)
+            params["maxResults"] = min(results_remaining, LIST_TASKS_PAGE_MAX)
             result = await asyncio.to_thread(service.tasks().list(**params).execute)
             more_tasks = result.get("items", [])
             next_page_token = result.get("nextPageToken")
