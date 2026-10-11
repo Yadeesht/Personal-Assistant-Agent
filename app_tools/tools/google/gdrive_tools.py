@@ -160,6 +160,23 @@ def build_drive_list_params(
     return list_params
 
 
+# Local files create_drive_file must never upload (a prompt-injected request could
+# otherwise copy the OAuth tokens or API keys to Drive).
+_PROJECT_DIR = Path(__file__).resolve().parents[3]
+PROTECTED_LOCAL_PATHS = (
+    _PROJECT_DIR / "app_tools" / "cred",
+    _PROJECT_DIR / ".env",
+    _PROJECT_DIR / "data",
+)
+
+
+def _is_protected_local_file(path: Path) -> bool:
+    resolved = path.expanduser().resolve()
+    if resolved.name == ".env" or resolved.name.endswith("_token.json"):
+        return True
+    return any(resolved == p or p in resolved.parents for p in PROTECTED_LOCAL_PATHS)
+
+
 SHORTCUT_MIME_TYPE = "application/vnd.google-apps.shortcut"
 FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
 BASE_SHORTCUT_FIELDS = (
@@ -586,12 +603,32 @@ async def create_drive_file(
             "mimeType": request.mime_type,
         }
 
-        # Handle fileUrl if provided
-        if request.fileUrl:
-            parsed_url = urlparse(request.fileUrl)
+        # Direct content, or the content behind fileUrl (content wins if both are given,
+        # so one call never creates two files).
+        parsed_url = urlparse(request.fileUrl) if request.fileUrl else None
+
+        if request.content:
+            file_data = request.content.encode("utf-8")
+            media = MediaIoBaseUpload(
+                io.BytesIO(file_data),
+                mimetype=request.mime_type,
+                resumable=True,
+                chunksize=UPLOAD_CHUNK_SIZE_BYTES,
+            )
+
+            created_file = await asyncio.to_thread(
+                service.files()
+                .create(
+                    body=file_metadata,
+                    media_body=media,
+                    fields="id, name, webViewLink",
+                    supportsAllDrives=True,
+                )
+                .execute
+            )
 
         # Handle file:// URLs
-        if parsed_url.scheme == "file":
+        elif parsed_url.scheme == "file":
             logger.info("[create_drive_file] Reading from local filesystem")
 
             # Convert file:// URL to local path
@@ -602,6 +639,10 @@ async def create_drive_file(
             file_path = url2pathname(raw_path)
 
             path_obj = Path(file_path)
+            if _is_protected_local_file(path_obj):
+                raise Exception(
+                    f"Refusing to upload '{file_path}': it holds credentials or private app data."
+                )
             if not path_obj.exists():
                 raise Exception(f"Local file does not exist: {file_path}")
             if not path_obj.is_file():
@@ -650,7 +691,8 @@ async def create_drive_file(
                 )
 
                 # Try to get MIME type from Content-Type header
-                content_type = resp.headers.get("Content-Type")
+                # "text/html; charset=utf-8" -> "text/html"
+                content_type = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
                 if content_type and content_type != "application/octet-stream":
                     request.mime_type = content_type
                     file_metadata["mimeType"] = request.mime_type
@@ -685,27 +727,6 @@ async def create_drive_file(
             raise Exception(
                 f"Unsupported URL scheme '{parsed_url.scheme}'. "
                 f"Only file:// (local environment), http://, and https:// are supported."
-            )
-
-        # Handle direct content
-        if request.content:
-            file_data = request.content.encode("utf-8")
-            media = MediaIoBaseUpload(
-                io.BytesIO(file_data),
-                mimetype=request.mime_type,
-                resumable=True,
-                chunksize=UPLOAD_CHUNK_SIZE_BYTES,
-            )
-
-            created_file = await asyncio.to_thread(
-                service.files()
-                .create(
-                    body=file_metadata,
-                    media_body=media,
-                    fields="id, name, webViewLink",
-                    supportsAllDrives=True,
-                )
-                .execute
             )
 
         link = created_file.get("webViewLink", "No link available")

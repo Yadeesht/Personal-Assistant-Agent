@@ -24,10 +24,13 @@ from config.prompts import (
     KNOWLEDGE_GRAPH_EXTRACTION_PROMPT,
     KNOWLEDGE_GRAPH_VALIDATION_PROMPT,
 )
-from config.settings import EMBEDDING_BGE_MODEL_PATH, KNOWLEDGE_GRAPH_DB
+from config.settings import BASE_DIR, EMBEDDING_BGE_MODEL_PATH, KNOWLEDGE_GRAPH_DB
 from utils.helper import first_line, load_sentence_model, setup_logger
 
 logger = setup_logger(__name__)
+
+# Where visualize() draws the graph. Absolute, so it works from any working directory.
+KNOWLEDGE_GRAPH_IMAGE = BASE_DIR / "docs" / "images" / "knowledge_graph.png"
 
 EntityType = Literal[
     "Person", "Project", "Organization", "Tool", "Concept", "Event", "Resource"
@@ -499,9 +502,9 @@ class KnowledgeGraph:
         )
         return {"entity": user, "connections": connections[:limit]}
 
-    def execute_query(self, query: str):
+    def execute_query(self, query: str, parameters: dict = None):
         try:
-            return self.conn.execute(query)
+            return self.conn.execute(query, parameters=parameters or {})
         except Exception as e:
             logger.info(f"Error executing query: {e}")
             return None
@@ -867,12 +870,11 @@ class KnowledgeGraph:
 
     def delete_entity(self, node_id: str):
         try:
-            query = f"""
-            MATCH (n:Entity) 
-            WHERE n.id = '{node_id}' 
-            DETACH DELETE n
-            """
-            self.execute_query(query)
+            # Parameters, not string formatting: names like "O'Brien" broke the query.
+            self.conn.execute(
+                "MATCH (n:Entity) WHERE n.id = $id DETACH DELETE n",
+                parameters={"id": node_id},
+            )
             logger.info(f"Entity '{node_id}' deleted successfully.")
         except Exception as e:
             logger.info(f"Error deleting entity: {e}")
@@ -880,12 +882,14 @@ class KnowledgeGraph:
 
     def delete_relationship(self, source: str, target: str):
         try:
-            query = f"""
-            MATCH (a:Entity)-[r:RELATED_TO]->(b:Entity)
-            WHERE a.id = '{source}' AND b.id = '{target}'
-            DELETE r
-            """
-            self.execute_query(query)
+            self.conn.execute(
+                """
+                MATCH (a:Entity)-[r:RELATED_TO]->(b:Entity)
+                WHERE a.id = $source AND b.id = $target
+                DELETE r
+                """,
+                parameters={"source": source, "target": target},
+            )
             logger.info(
                 f"Relationship from '{source}' to '{target}' deleted successfully."
             )
@@ -1059,18 +1063,22 @@ class KnowledgeGraph:
             )
             result = self.execute_query(query)
 
-            while result.has_next():
+            while result is not None and result.has_next():
                 row = result.get_next()
                 node_id, description = row[0], row[1]
                 embedding = self._compute_embedding(description)
-                update_query = f"MATCH (n:Entity) WHERE n.id = '{node_id}' SET n.embedding = {embedding}"
-                self.execute_query(update_query)
+                if embedding is None:
+                    continue
+                self.execute_query(
+                    "MATCH (n:Entity) WHERE n.id = $id SET n.embedding = $embedding",
+                    parameters={"id": node_id, "embedding": embedding},
+                )
 
             logger.info("Graph preprocessing complete: All nodes have embeddings.")
         except Exception as e:
             logger.info(f"Error during graph preprocessing: {e}")
 
-    def visualize(self, output_path: str = "docs/images/knowledge_graph.png"):
+    def visualize(self, output_path: str = str(KNOWLEDGE_GRAPH_IMAGE)):
         try:
             nodes_res = self.conn.execute("MATCH (n:Entity) RETURN n.id, n.type")
             rels_res = self.conn.execute(
@@ -1122,10 +1130,11 @@ class KnowledgeGraph:
             plt.tight_layout()
             plt.savefig(output_path, dpi=300)
             plt.close()
-            print(f"✅ Visualization saved with improved spacing: {output_path}")
+            logger.info(f"✅ Knowledge graph picture saved: {output_path}")
 
         except Exception as e:
-            print(f"Error during visualization: {e}")
+            plt.close("all")
+            logger.warning(f"Error during visualization: {e}")
 
     def generate_entity_relation(
         self, text: str, prompt=KNOWLEDGE_GRAPH_EXTRACTION_PROMPT

@@ -601,15 +601,16 @@ class EpisodicRAG:
                     )
                 )
 
-            if conditions.get("start_time") and conditions.get("end_time"):
+            if conditions.get("start_time") or conditions.get("end_time"):
                 # "timestamp" is stored as an ISO-8601 string, so a numeric
                 # Range would raise a validation error — DatetimeRange accepts
-                # ISO-8601 strings directly.
+                # ISO-8601 strings directly. Either bound may be given alone.
                 must.append(
                     models.FieldCondition(
                         key="timestamp",
                         range=models.DatetimeRange(
-                            gte=conditions["start_time"], lte=conditions["end_time"]
+                            gte=conditions.get("start_time") or None,
+                            lte=conditions.get("end_time") or None,
                         ),
                     )
                 )

@@ -56,7 +56,10 @@ def test_without_options_the_client_defaults_are_used(azure, monkeypatch):
     monkeypatch.setattr(llm, "MODEL_TOOL_REASONING_EFFORT", None)
 
     with_tools = llm.build_llm_with_tools([search_emails], "gpt-4.1-mini")
-    assert with_tools.bound.temperature == 0.7
+    # Nothing is sent: the client keeps its own default (None in langchain-openai 1.x,
+    # i.e. the model's default temperature).
+    default = type(with_tools.bound).model_fields["temperature"].default
+    assert with_tools.bound.temperature == default
     assert with_tools.bound.reasoning_effort is None
 
 

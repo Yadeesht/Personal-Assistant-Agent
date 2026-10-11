@@ -75,6 +75,12 @@ def _parse_reminders_json(
     if not reminders_input:
         return []
 
+    # Validated requests hold pydantic ReminderItem models, not dicts.
+    if isinstance(reminders_input, list):
+        reminders_input = [
+            r.model_dump() if hasattr(r, "model_dump") else r for r in reminders_input
+        ]
+
     # Handle both string (JSON) and list inputs
     if isinstance(reminders_input, str):
         try:
@@ -284,6 +290,14 @@ def _correct_time_format_for_api(
             )
             return time_str
 
+    # YYYY-MM-DDTHH:MM (no seconds, no offset): add seconds and the IST offset
+    if len(time_str) == 16 and time_str[10] == "T" and time_str.count(":") == 1:
+        try:
+            datetime.datetime.strptime(time_str, "%Y-%m-%dT%H:%M")
+            return f"{time_str}:00{CALENDAR_UTC_OFFSET}"
+        except ValueError:
+            return time_str
+
     # If it already has timezone info or doesn't match our patterns, return as is
     logger.info(f"{param_name} '{time_str}' doesn't need formatting, using as is.")
     return time_str
@@ -465,10 +479,10 @@ async def get_events(
                     error=f"Event with ID '{request.event_id}' not found in calendar '{request.calendar_id}'.",
                 ).model_dump_json(indent=2)
             else:
+                # An empty range is an answer ("you are free"), not a failure.
                 return GetEventsResponse(
-                    status="error",
-                    message="",
-                    error=f"No events found in calendar '{request.calendar_id}' for the specified time range.",
+                    status="success",
+                    message=f"No events found in calendar '{request.calendar_id}' for the specified time range.",
                 ).model_dump_json(indent=2)
 
         # Handle returning detailed output for a single event when requested
@@ -579,12 +593,16 @@ async def get_events(
         ).model_dump_json(indent=2)
     except HttpError as error:
         error_msg = f"HTTP error occurred: {error}"
-        logger.error(f"[delete_event] {error_msg}")
-        return json.dumps({"error": error_msg})
+        logger.error(f"[get_events] {error_msg}")
+        return GetEventsResponse(
+            status="error", message="", error=error_msg
+        ).model_dump_json(indent=2)
     except Exception as error:
         error_msg = f"An error occurred: {str(error)}"
-        logger.error(f"[delete_event] {error_msg}")
-        return json.dumps({"error": error_msg})
+        logger.error(f"[get_events] {error_msg}")
+        return GetEventsResponse(
+            status="error", message="", error=error_msg
+        ).model_dump_json(indent=2)
 
 
 @planning_server.tool()
@@ -949,10 +967,10 @@ async def modify_event(
             else:
                 # Preserve existing event's useDefault value if not explicitly specified
                 try:
-                    existing_event = (
+                    existing_event = await asyncio.to_thread(
                         service.events()
                         .get(calendarId=request.calendar_id, eventId=request.event_id)
-                        .execute()
+                        .execute
                     )
                     reminder_data["useDefault"] = existing_event.get(
                         "reminders", {}
@@ -1014,7 +1032,8 @@ async def modify_event(
                 "[modify_event] Successfully retrieved existing event before update"
             )
 
-            # Fields not in event_body are left as they are by the patch below.
+            # Fields not in event_body (including an existing Google Meet) are left
+            # as they are by the patch below.
 
             # Handle Google Meet conference data
             if request.add_google_meet is not None:
@@ -1034,10 +1053,6 @@ async def modify_event(
                     # Remove Google Meet: null clears the field in a patch
                     event_body["conferenceData"] = None
                     logger.info("[modify_event] Removing Google Meet conference")
-            elif "conferenceData" in existing_event:
-                # Preserve existing conference data if not specified
-                event_body["conferenceData"] = existing_event["conferenceData"]
-                logger.info("[modify_event] Preserving existing conference data")
 
         except HttpError as get_error:
             if get_error.resp.status == 404:

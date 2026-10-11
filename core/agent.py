@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import threading
 import time
 from datetime import datetime
@@ -18,6 +19,7 @@ from langchain_core.messages import (
 import config.prompts as prompt_texts
 from config.settings import DEFAULT_THREAD_ID, MEMORY_DB
 from core.codeagent import CodeExecutionAgent
+from core.confirm import is_approval
 from core.llm import build_llm
 from core.state import State, plan_summary
 from rag.episodic_rag import EpisodicRAG
@@ -134,6 +136,19 @@ AGENT_MESSAGE_KEY = {
 def _resolve_agent_messages(state: State, agent_name: str):
     message_key = AGENT_MESSAGE_KEY.get(agent_name, "messages")
     return state.get(message_key, []) or state.get("messages", [])
+
+
+def _error_reply(agent_name: str, text: str, current_time: str) -> dict:
+    """State update for a model call that failed: the error goes to the shared list and to
+    the agent's own list (the one main.py shows), and the agent stays active."""
+    message = AIMessage(
+        content=text, name=agent_name, additional_kwargs={"timestamp": current_time}
+    )
+    return {
+        "messages": [message],
+        AGENT_MESSAGE_KEY.get(agent_name, "messages"): [message],
+        "current_agent": agent_name,
+    }
 
 
 def _thread_id(config: RunnableConfig) -> str:
@@ -266,39 +281,12 @@ def supervisor_node_factory(
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 429:
                 logger.error("🚫 Rate limit hit in supervisor - stopping")
-                return {
-                    "next": "FINISH",
-                    "messages": [
-                        AIMessage(
-                            content="[ERROR] Rate limit reached.",
-                            name=agent_name,
-                            additional_kwargs={"timestamp": current_time},
-                        )
-                    ],
-                }
+                return _error_reply(agent_name, "[ERROR] Rate limit reached.", current_time)
             logger.error(f"HTTP error in supervisor: {e}")
-            return {
-                "next": "FINISH",
-                "messages": [
-                    AIMessage(
-                        content=f"[ERROR] {e}",
-                        name=agent_name,
-                        additional_kwargs={"timestamp": current_time},
-                    )
-                ],
-            }
+            return _error_reply(agent_name, f"[ERROR] {e}", current_time)
         except httpx.RequestError as e:
             logger.error(f"🚫 Network error in supervisor: {e}")
-            return {
-                "next": "FINISH",
-                "messages": [
-                    AIMessage(
-                        content="[ERROR] Network unavailable.",
-                        name=agent_name,
-                        additional_kwargs={"timestamp": current_time},
-                    )
-                ],
-            }
+            return _error_reply(agent_name, "[ERROR] Network unavailable.", current_time)
         except Exception as e:
             logger.error(f"Error in supervisor_node: {e}")
             return {
@@ -418,28 +406,20 @@ def agent_node_factory(llm_with_tools, system_prompt, agent_name: str):
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 429:
                 logger.error("🚫 Rate limit hit - stopping execution")
-                return {
-                    "messages": [
-                        AIMessage(
-                            content="[ERROR] Rate limit reached. Please retry later.",
-                            name=current_agent_name,
-                            additional_kwargs={"timestamp": current_time},
-                        )
-                    ]
-                }
+                return _error_reply(
+                    current_agent_name,
+                    "[ERROR] Rate limit reached. Please retry later.",
+                    current_time,
+                )
             logger.error(f"HTTP error: {e}")
             raise
         except httpx.RequestError as e:
             logger.error(f"🚫 Network error - no internet connection: {e}")
-            return {
-                "messages": [
-                    AIMessage(
-                        content="[ERROR] Network unavailable. Check connection.",
-                        name=current_agent_name,
-                        additional_kwargs={"timestamp": current_time},
-                    )
-                ]
-            }
+            return _error_reply(
+                current_agent_name,
+                "[ERROR] Network unavailable. Check connection.",
+                current_time,
+            )
         except Exception as e:
             logger.error(f"Unexpected error: {e}")
             raise
@@ -517,34 +497,90 @@ def agent_node_factory(llm_with_tools, system_prompt, agent_name: str):
     return agent_node
 
 
+# Replies that run the code waiting for approval, besides core.confirm's approvals.
+CODE_RUN_REPLIES = {"run", "run it", "execute", "execute it", "approve it", "go"}
+# Replies that cancel it. Anything else is taken as feedback and the code is rewritten.
+CODE_DECLINE_REPLIES = {
+    "no", "n", "nope", "cancel", "stop", "abort", "dont", "don't", "do not run it",
+    "dont run it", "don't run it", "never mind", "nevermind", "skip",
+}
+_CODE_BLOCK = re.compile(r"```(?:python|py)?[ \t]*\n(.*?)\n?```", re.DOTALL)
+
+
+def _normalized_reply(reply: str) -> str:
+    kept = "".join(ch for ch in (reply or "").lower() if ch.isalnum() or ch in " '")
+    return " ".join(kept.split())
+
+
+def _is_code_approval(reply: str) -> bool:
+    return is_approval(reply) or _normalized_reply(reply) in CODE_RUN_REPLIES
+
+
+def _is_code_decline(reply: str) -> bool:
+    return _normalized_reply(reply) in CODE_DECLINE_REPLIES
+
+
+def _pending_code(messages: list):
+    """The code in the code agent's latest approval request, if the user has not
+    answered it yet (nothing but the user's reply comes after it)."""
+    for msg in reversed(messages[:-1] if messages else []):
+        if msg.type == "ai" and isinstance(msg.content, str):
+            match = _CODE_BLOCK.search(msg.content)
+            return match.group(1) if match else None
+        if msg.type == "human":
+            return None
+    return None
+
+
+def _code_agent_done(agent_name: str, text: str, result: str, current_time: str) -> dict:
+    """End the code agent's work: its message for the record, and the result handed to
+    the supervisor (as a worker's work_completion does) so it can answer the user."""
+    agent_message = AIMessage(
+        content=text, name=agent_name, additional_kwargs={"timestamp": current_time}
+    )
+    handoff = HumanMessage(
+        content=f"[{agent_name} to supervisor] Handoff. Result: {result}", name=agent_name
+    )
+    return {
+        "messages": [agent_message],
+        "code_messages": [agent_message],
+        "supervisor_messages": [handoff],
+        "current_agent": "supervisor",
+    }
+
+
 def code_execution_factory(llm, tool_sets, agent_name: str):
     """Create the code execution node that runs CodeExecutionAgent workflows with user permission checks and local Port 9000 sandbox."""
 
     async def code_executor(state: State, config: RunnableConfig):
         """Execute one code-agent turn and return code or execution output depending on approval state."""
-        import re
         current_time = get_current_time()
         current_agent_name = agent_name
         thread_id = _thread_id(config)
 
         scoped_messages = _resolve_agent_messages(state, current_agent_name)
         
-        # Check if the user is approving a previously generated code block
+        # Check if the user is answering a previously generated code block
         is_approved = False
         code_to_run = None
-        
+        reply = ""
+
         last_msg = scoped_messages[-1] if scoped_messages else None
-        if last_msg and last_msg.type == "human":
-            content_lower = (last_msg.content or "").strip().lower()
-            if content_lower in ["approve", "yes", "run", "ok", "run it"]:
-                # Traverse backward to find the last AI message with python code
-                for msg in reversed(scoped_messages):
-                    if msg.type == "ai" and "```python" in msg.content:
-                        match = re.search(r"```python\n(.*?)\n```", msg.content, re.DOTALL)
-                        if match:
-                            code_to_run = match.group(1)
-                            is_approved = True
-                            break
+        pending_code = _pending_code(scoped_messages)
+        if last_msg and last_msg.type == "human" and not last_msg.name and pending_code:
+            reply = last_msg.content if isinstance(last_msg.content, str) else str(last_msg.content)
+            if _is_code_approval(reply):
+                code_to_run = pending_code
+                is_approved = True
+            elif _is_code_decline(reply):
+                logger.info("Code execution declined by user.")
+                return _code_agent_done(
+                    current_agent_name,
+                    "Okay, I did not run the code.",
+                    "SIR declined running the generated code; nothing was executed. "
+                    f"SIR said: {json.dumps(reply)}",
+                    current_time,
+                )
 
         if is_approved and code_to_run:
             logger.info("Code execution approved by user! Running...")
@@ -578,26 +614,16 @@ def code_execution_factory(llm, tool_sets, agent_name: str):
                 else:
                     error_msg = msg.get("error", "Unknown sandbox error")
                     response_text = f"Code execution failed with error:\n\n```\n{error_msg}\n```"
-                    
-                agent_message = AIMessage(
-                    content=response_text,
-                    name=current_agent_name,
-                    additional_kwargs={"timestamp": current_time}
+
+                # Hand back to the supervisor with the result, like a worker's
+                # work_completion: it answers the user from it.
+                return _code_agent_done(
+                    current_agent_name, response_text, response_text, current_time
                 )
-                
-                return {
-                    "messages": [agent_message],
-                    "code_messages": [agent_message],
-                    "current_agent": "supervisor" # Handoff back to supervisor
-                }
             except Exception as e:
                 logger.error(f"Error running approved code: {e}")
-                err_msg = AIMessage(content=f"Error executing code: {str(e)}", name=current_agent_name)
-                return {
-                    "messages": [err_msg],
-                    "code_messages": [err_msg],
-                    "current_agent": "supervisor"
-                }
+                text = f"Error executing code: {str(e)}"
+                return _code_agent_done(current_agent_name, text, text, current_time)
         else:
             # Generate the Python code first and request user approval
             logger.info("Generating code and requesting user approval...")
@@ -614,12 +640,8 @@ def code_execution_factory(llm, tool_sets, agent_name: str):
                 task_spec = await agent._resolve_intent(last_messages)
                 
                 if not task_spec.required_tools_hint and not task_spec.primary_goal:
-                    err_msg = AIMessage(content="Could not parse intent for code execution.", name=current_agent_name)
-                    return {
-                        "messages": [err_msg],
-                        "code_messages": [err_msg],
-                        "current_agent": "supervisor"
-                    }
+                    text = "Could not parse intent for code execution."
+                    return _code_agent_done(current_agent_name, text, text, current_time)
                     
                 tool_schemas = await agent._load_tool_schemas(task_spec.required_tools_hint)
                 code_prompt = agent._build_code_generation_prompt(task_spec, tool_schemas)
@@ -644,12 +666,8 @@ def code_execution_factory(llm, tool_sets, agent_name: str):
                 }
             except Exception as e:
                 logger.error(f"Error generating code: {e}")
-                err_msg = AIMessage(content=f"Error generating code: {str(e)}", name=current_agent_name)
-                return {
-                    "messages": [err_msg],
-                    "code_messages": [err_msg],
-                    "current_agent": "supervisor"
-                }
+                text = f"Error generating code: {str(e)}"
+                return _code_agent_done(current_agent_name, text, text, current_time)
 
     return code_executor
 
@@ -1014,7 +1032,10 @@ async def updation_knowledge_graph(db_path: str = MEMORY_DB, logged_before=None)
 
         if kg is not None:
             invalidate_profile()
-            kg.visualize()
+            try:
+                kg.visualize()
+            except Exception as e:  # only a picture: the facts are already stored
+                logger.warning(f"Knowledge graph picture not updated: {e}")
         logger.info("✅ Knowledge graph update process completed successfully.")
         return True
 
@@ -1152,6 +1173,17 @@ def _latest_user_request(state: dict) -> str:
     return ""
 
 
+# The agents route_to_agent can hand a task to.
+WORKER_AGENTS = (
+    "communication_agent",
+    "planning_agent",
+    "document_agent",
+    "data_agent",
+    "presentation_agent",
+    "code_agent",
+)
+
+
 @tool
 def route_to_agent(
     state: Annotated[dict, InjectedState],
@@ -1183,8 +1215,23 @@ def route_to_agent(
       needs (e.g. "the names and email addresses of Yadeesh's direct reports"). The worker
       then only looks it up and changes nothing. Leave it empty for a normal handoff.
     """
+    if agent not in WORKER_AGENTS:
+        # An unknown name would be reported as a successful handoff while nobody
+        # picks the task up.
+        error = ToolMessage(
+            content=(
+                f"Error: unknown agent '{agent}'. Use one of: {', '.join(WORKER_AGENTS)}."
+            ),
+            tool_call_id=tool_call_id,
+        )
+        return Command(
+            update={
+                "supervisor_messages": [error],
+                "messages": [error],
+                "current_agent": "supervisor",
+            }
+        )
     if agent == "code_agent":
-        import json
         from pathlib import Path
         enabled_tools_file = Path(__file__).resolve().parent.parent / "data" / "enabled_tools.json"
         is_enabled = True

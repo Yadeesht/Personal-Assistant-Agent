@@ -53,6 +53,35 @@ def clean_email_body(text: str) -> str:
     return text
 
 
+class _ApproximateEncoding:
+    """Used when tiktoken's tokenizer file cannot be loaded (it is downloaded on first
+    use, so this happens offline or behind a proxy): about 4 characters per token."""
+
+    def encode(self, text: str) -> list:
+        return [0] * ((len(text) + 3) // 4)
+
+
+_encoding = None
+
+
+def _get_encoding():
+    """The tokenizer, loaded once. Falls back to an estimate instead of failing every
+    message (token counts are only used for summary thresholds and logs)."""
+    global _encoding
+    if _encoding is None:
+        try:
+            try:
+                _encoding = tiktoken.encoding_for_model("gpt-4")
+            except KeyError:
+                _encoding = tiktoken.get_encoding("cl100k_base")
+        except Exception as e:
+            logging.getLogger(__name__).warning(
+                f"tiktoken tokenizer unavailable ({type(e).__name__}); estimating token counts."
+            )
+            _encoding = _ApproximateEncoding()
+    return _encoding
+
+
 def count_tokens(messages):
     """
     Count tokens for messages. Handles both:
@@ -60,10 +89,7 @@ def count_tokens(messages):
     - List of plain strings
     - Single string
     """
-    try:
-        encoding = tiktoken.encoding_for_model("gpt-4")
-    except KeyError:
-        encoding = tiktoken.get_encoding("cl100k_base")
+    encoding = _get_encoding()
 
     # Handle single string input
     if isinstance(messages, str):

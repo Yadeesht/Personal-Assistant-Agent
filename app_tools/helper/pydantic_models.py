@@ -38,7 +38,7 @@ class EmailResponse(BaseModel):
 class UnreadEmailsRequest(BaseModel):
     """Get unread emails request"""
 
-    date: int = Field(10, ge=1, le=365, description="Days to look back")
+    date: int = Field(10, ge=0, le=365, description="Days to look back (0 = today)")
     max_results: int = Field(20, ge=1, le=500, description="Max results")
 
 
@@ -64,7 +64,8 @@ class UnreadEmailsResponse(BaseModel):
     """Unread emails response"""
 
     count: int
-    emails: List[EmailMetadata]
+    emails: List[EmailMetadata] = []
+    error: Optional[str] = None
 
 
 class LabelRequest(BaseModel):
@@ -1128,7 +1129,6 @@ class CreateFormResponse(BaseModel):
 class GetFormRequest(BaseModel):
     """Get form request"""
 
-    user_google_email: str = Field(..., description="User's Google email")
     form_id: str = Field(..., min_length=1, description="Form ID")
 
 
@@ -1144,8 +1144,8 @@ class SetPublishSettingsRequest(BaseModel):
     """Set publish settings request"""
 
     form_id: str = Field(..., min_length=1, description="Form ID")
-    publish_as_template: bool = Field(False, description="Publish as template")
-    require_authentication: bool = Field(False, description="Require authentication")
+    is_published: bool = Field(True, description="Form is published")
+    is_accepting_responses: bool = Field(True, description="Form accepts responses")
 
 
 class SetPublishSettingsResponse(BaseModel):
@@ -1579,7 +1579,7 @@ class DocOperation(BaseModel):
 
     type: str = Field(
         ...,
-        pattern=r"^(insert_text|delete_text|replace_text|format_text|insert_table|insert_page_break)$",
+        pattern=r"^(insert_text|delete_text|replace_text|format_text|insert_table|insert_page_break|find_replace)$",
         description="Operation type",
     )
     index: Optional[int] = Field(None, ge=0, description="Position for operation")
@@ -1593,6 +1593,10 @@ class DocOperation(BaseModel):
     underline: Optional[bool] = None
     font_size: Optional[int] = Field(None, ge=6, le=400)
     font_family: Optional[str] = None
+    # find_replace
+    find_text: Optional[str] = None
+    replace_text: Optional[str] = None
+    match_case: Optional[bool] = None
 
 
 class BatchUpdateDocRequest(BaseModel):

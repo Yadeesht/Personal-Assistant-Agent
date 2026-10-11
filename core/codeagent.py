@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Dict, Any, List, Callable
 from utils.helper import setup_logger
 from langchain_core.messages import BaseMessage
+from config.settings import CONFIRM_BEFORE_TOOLS
 from core.state import TaskSpec
 
 
@@ -58,6 +59,10 @@ class CodeExecutionAgent:
                 active_tools.extend(tools)
 
         for tool in active_tools:
+            if tool.name in CONFIRM_BEFORE_TOOLS:
+                # Needs the user's yes per call (core/confirm.py): never reachable from
+                # generated code, which would skip that confirmation.
+                continue
 
             def make_wrapper(t):
                 async def wrapper(**kwargs):
@@ -213,6 +218,8 @@ class CodeExecutionAgent:
 
                 tool_schemas = []
                 for t in tools:
+                    if t.name in CONFIRM_BEFORE_TOOLS:
+                        continue
                     # Debug: See what attributes the tool has
                     logger.debug(f"Tool: {t.name}, Type: {type(t).__name__}")
                     logger.debug(
@@ -232,8 +239,8 @@ class CodeExecutionAgent:
                         if isinstance(t.args_schema, dict):
                             schema["parameters"] = t.args_schema
                         else:
-                            # It's a Pydantic model, call .schema()
-                            schema["parameters"] = t.args_schema.schema()
+                            # It's a Pydantic model
+                            schema["parameters"] = t.args_schema.model_json_schema()
                     elif hasattr(t, "args"):
                         schema["parameters"] = t.args
                     else:
@@ -483,11 +490,8 @@ async def {tool_name}(**kwargs):
         return "\n".join(formatted)
 
     def _extract_code_block(self, response: str) -> str:
-        """Extract code from markdown code blocks"""
-        import re
-
-        pattern = r"```python\n(.*?)\n```"
-        match = re.search(pattern, response, re.DOTALL)
+        """Extract code from markdown code blocks (```python, ```py or a bare ```)."""
+        match = re.search(r"```(?:python|py)?[ \t]*\n(.*?)\n?```", response, re.DOTALL)
         if match:
             return match.group(1)
         return response

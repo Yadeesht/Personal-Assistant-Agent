@@ -76,19 +76,37 @@ async def create_form(
     logger.info(f"[create_form] Invoked. Title: {request.title}")
 
     try:
+        # forms.create copies only the title and document title; anything else in the
+        # body is rejected, so the description is set with a batchUpdate afterwards.
         form_body: Dict[str, Any] = {"info": {"title": request.title}}
 
-        if request.description:
-            form_body["info"]["description"] = request.description
-
         if request.document_title:
-            form_body["info"]["document_title"] = request.document_title
+            form_body["info"]["documentTitle"] = request.document_title
 
         created_form = await asyncio.to_thread(
             service.forms().create(body=form_body).execute
         )
 
         form_id = created_form.get("formId")
+
+        if request.description:
+            await asyncio.to_thread(
+                service.forms()
+                .batchUpdate(
+                    formId=form_id,
+                    body={
+                        "requests": [
+                            {
+                                "updateFormInfo": {
+                                    "info": {"description": request.description},
+                                    "updateMask": "description",
+                                }
+                            }
+                        ]
+                    },
+                )
+                .execute
+            )
         edit_url = f"https://docs.google.com/forms/d/{form_id}/edit"
         responder_url = created_form.get(
             "responderUri", f"https://docs.google.com/forms/d/{form_id}/viewform"
@@ -114,7 +132,7 @@ async def create_form(
 
 
 @content_server.tool()
-async def get_form(user_google_email: str, form_id: str) -> str:
+async def get_form(form_id: str) -> str:
     """
     Get a form.
 
@@ -126,10 +144,7 @@ async def get_form(user_google_email: str, form_id: str) -> str:
     """
     # Validate input parameters
     try:
-        request = GetFormRequest(
-            user_google_email=user_google_email,
-            form_id=form_id,
-        )
+        request = GetFormRequest(form_id=form_id)
     except Exception as e:
         error_msg = f"Invalid parameters: {str(e)}"
         logger.error(f"[get_form] {error_msg}")
@@ -198,16 +213,16 @@ async def get_form(user_google_email: str, form_id: str) -> str:
 @content_server.tool()
 async def set_publish_settings(
     form_id: str,
-    publish_as_template: bool = False,
-    require_authentication: bool = False,
+    is_published: bool = True,
+    is_accepting_responses: bool = True,
 ) -> str:
     """
-    Updates the publish settings of a form.
+    Publishes or unpublishes a form, and opens or closes it for responses.
 
     Args:
         form_id (str): The ID of the form to update publish settings for.
-        publish_as_template (bool): Whether to publish as a template. Defaults to False.
-        require_authentication (bool): Whether to require authentication to view/submit. Defaults to False.
+        is_published (bool): Whether the form is published and visible to responders. Defaults to True.
+        is_accepting_responses (bool): Whether the form accepts responses. Defaults to True. Must be False when is_published is False.
 
     Returns:
         str: Confirmation message of the successful publish settings update.
@@ -216,8 +231,8 @@ async def set_publish_settings(
     try:
         request = SetPublishSettingsRequest(
             form_id=form_id,
-            publish_as_template=publish_as_template,
-            require_authentication=require_authentication,
+            is_published=is_published,
+            is_accepting_responses=is_accepting_responses,
         )
     except Exception as e:
         error_msg = f"Invalid parameters: {str(e)}"
@@ -226,13 +241,26 @@ async def set_publish_settings(
             status="error", message="", error=error_msg
         ).model_dump_json(indent=2)
 
-    service = get_service()
+    if request.is_accepting_responses and not request.is_published:
+        return SetPublishSettingsResponse(
+            status="error",
+            message="",
+            error="A form that is not published cannot accept responses. Set is_accepting_responses=False or is_published=True.",
+        ).model_dump_json(indent=2)
+
     logger.info(f"[set_publish_settings] Invoked. Form ID: {request.form_id}")
 
     try:
+        service = get_service()
+        # The API takes the publish state under publishSettings, with both fields set.
         settings_body = {
-            "publishAsTemplate": request.publish_as_template,
-            "requireAuthentication": request.require_authentication,
+            "publishSettings": {
+                "publishState": {
+                    "isPublished": request.is_published,
+                    "isAcceptingResponses": request.is_accepting_responses,
+                }
+            },
+            "updateMask": "publishState",
         }
 
         await asyncio.to_thread(
@@ -241,7 +269,7 @@ async def set_publish_settings(
             .execute
         )
 
-        message = f"Successfully updated publish settings for form {request.form_id}. Publish as template: {request.publish_as_template}, Require authentication: {request.require_authentication}"
+        message = f"Successfully updated publish settings for form {request.form_id}. Published: {request.is_published}, Accepting responses: {request.is_accepting_responses}"
         logger.info(
             f"Publish settings updated successfully. Form ID: {request.form_id}"
         )
@@ -304,9 +332,16 @@ async def get_form_response(form_id: str, response_id: str) -> str:
         answer_details = []
         for question_id, answer_data in answers.items():
             question_response = answer_data.get("textAnswers", {}).get("answers", [])
+            uploads = answer_data.get("fileUploadAnswers", {}).get("answers", [])
             if question_response:
                 answer_text = ", ".join(
                     [ans.get("value", "") for ans in question_response]
+                )
+                answer_details.append(f"  Question ID {question_id}: {answer_text}")
+            elif uploads:
+                answer_text = ", ".join(
+                    f"{u.get('fileName', 'file')} (Drive ID: {u.get('fileId', '?')})"
+                    for u in uploads
                 )
                 answer_details.append(f"  Question ID {question_id}: {answer_text}")
             else:
