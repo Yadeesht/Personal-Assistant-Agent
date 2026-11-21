@@ -1,0 +1,22 @@
+# These are important to set up on your side. An example file has been added for reference.
+**/.env
+
+# The README has detailed setup instructions for all three folders below.
+**/cred/
+**/data/
+**/models/
+
+# Virtual environment and cache files — no manual setup needed.
+**/.venv/
+**/__pycache__/
+
+# Log and test files — generated at runtime, no action needed.
+**/result.txt
+**/todo.txt
+**/test/
+**/dummy.txt
+**/log_details.txt
+**/checkpoint_text_dump.txt
+
+# Redrawn from your own memory after every save, so it shows personal facts.
+docs/images/knowledge_graph.png

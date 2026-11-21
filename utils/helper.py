@@ -1,0 +1,422 @@
+import logging
+import logging.handlers
+import os
+import shutil
+import sqlite3
+import sys
+import tiktoken
+from datetime import datetime
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+import pytz
+from rich.console import Console
+from rich.logging import RichHandler
+
+import re
+import html
+import asyncio
+import json
+import unicodedata
+import aiosqlite
+from pathlib import Path
+
+from config.settings import CHECKPOINT_DB
+from config.settings import DATA_DIR
+from config.settings import DEFAULT_THREAD_ID
+
+
+def clean_email_body(text: str) -> str:
+    # 1. Decode HTML entities (e.g., convert &#39; to ')
+    text = html.unescape(text)
+
+    # 2. Strip ZWNJ and other invisible junk: format/control characters plus the
+    #    combining grapheme joiner used as preheader padding. Whitespace stays for
+    #    step 4 (so lines don't run together) and visible text such as ₹, — and
+    #    accented letters is kept.
+    text = "".join(
+        ch
+        for ch in text
+        if ch.isspace()
+        or (unicodedata.category(ch) not in ("Cf", "Cc") and ch != "͏")
+    )
+
+    # 3. Remove repeated special characters (like those divider lines -----)
+    text = re.sub(r"[-*=_]{3,}", " ", text)
+
+    # 4. Normalize whitespace
+    text = " ".join(text.split())
+
+    text = re.sub(r"\(mailto:[^)]*\)", "", text)
+
+    # Optional: Clean up the [Awesome], [Decent] text left behind
+    text = re.sub(r"\[Awesome\]|\[Decent\]|\[Not Great\]", "", text)
+
+    return text
+
+
+class _ApproximateEncoding:
+    """Used when tiktoken's tokenizer file cannot be loaded (it is downloaded on first
+    use, so this happens offline or behind a proxy): about 4 characters per token."""
+
+    def encode(self, text: str) -> list:
+        return [0] * ((len(text) + 3) // 4)
+
+
+_encoding = None
+
+
+def _get_encoding():
+    """The tokenizer, loaded once. Falls back to an estimate instead of failing every
+    message (token counts are only used for summary thresholds and logs)."""
+    global _encoding
+    if _encoding is None:
+        try:
+            try:
+                _encoding = tiktoken.encoding_for_model("gpt-4")
+            except KeyError:
+                _encoding = tiktoken.get_encoding("cl100k_base")
+        except Exception as e:
+            logging.getLogger(__name__).warning(
+                f"tiktoken tokenizer unavailable ({type(e).__name__}); estimating token counts."
+            )
+            _encoding = _ApproximateEncoding()
+    return _encoding
+
+
+def count_tokens(messages):
+    """
+    Count tokens for messages. Handles both:
+    - List of message objects with .content attribute
+    - List of plain strings
+    - Single string
+    """
+    encoding = _get_encoding()
+
+    # Handle single string input
+    if isinstance(messages, str):
+        return len(encoding.encode(messages))
+
+    # Handle list of messages
+    num_tokens = 0
+    for message in messages:
+        if isinstance(message, str):
+            # Plain string - just encode it
+            num_tokens += len(encoding.encode(message))
+        elif hasattr(message, "content"):
+            # Message object with content attribute
+            num_tokens += 4  # Message formatting overhead
+            num_tokens += len(encoding.encode(str(message.content)))
+        else:
+            # Unknown type, try to convert to string
+            num_tokens += len(encoding.encode(str(message)))
+
+    # Add reply priming tokens only for message objects (not plain strings)
+    if messages and not isinstance(messages[0], str):
+        num_tokens += 2
+
+    return num_tokens
+
+
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+console = Console()
+
+
+# Threads that work in the background while the user types (memory saving, model
+# preloading) are named with this prefix. Their routine messages would land in the
+# middle of the input prompt, so the console shows only their warnings and errors;
+# everything they log goes to data/logs/memory.log.
+BACKGROUND_THREAD_PREFIX = "memory-"
+# MEMORY_LOG_FILE overrides the location (the tests point it at a temp file).
+BACKGROUND_LOG_FILE = Path(os.getenv("MEMORY_LOG_FILE") or DATA_DIR / "logs" / "memory.log")
+
+
+def _from_background_thread(record: logging.LogRecord) -> bool:
+    return (record.threadName or "").startswith(BACKGROUND_THREAD_PREFIX)
+
+
+def setup_logger(name: str = __name__) -> logging.Logger:
+    """Configure and return a logger instance with clean Rich formatting"""
+    root_logger = logging.getLogger()
+    if not any(isinstance(h, RichHandler) for h in root_logger.handlers):
+        root_logger.handlers = [
+            h for h in root_logger.handlers if not isinstance(h, logging.StreamHandler)
+        ]
+        handler = RichHandler(
+            console=console,
+            rich_tracebacks=True,
+            show_path=False,
+            markup=False,
+            omit_repeated_times=False,
+        )
+        handler.setFormatter(logging.Formatter("%(message)s", datefmt="[%X]"))
+        handler.addFilter(
+            lambda r: r.levelno >= logging.WARNING or not _from_background_thread(r)
+        )
+        root_logger.addHandler(handler)
+
+        try:
+            BACKGROUND_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            file_handler = logging.handlers.RotatingFileHandler(
+                BACKGROUND_LOG_FILE, maxBytes=1_000_000, backupCount=3, encoding="utf-8"
+            )
+            file_handler.setFormatter(
+                logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+            )
+            file_handler.addFilter(_from_background_thread)
+            root_logger.addHandler(file_handler)
+        except OSError as e:
+            root_logger.warning(f"Background log file unavailable: {e}")
+
+        root_logger.setLevel(logging.INFO)
+    return logging.getLogger(name)
+
+
+def first_line(error: Exception, limit: int = 300) -> str:
+    """The first line of an error message, for logs (some library errors run to pages)."""
+    text = str(error).strip().splitlines()[0] if str(error).strip() else type(error).__name__
+    return text[:limit]
+
+
+def load_sentence_model(local_path, hub_name: str):
+    """Load a sentence-transformers model from local_path, getting it from the
+    Hugging Face hub (or its local cache) and saving it there first if needed.
+
+    The model is saved into a temporary folder that is renamed into place only when
+    complete, so a run stopped mid-save cannot leave a half-written model behind. A
+    folder without modules.json (e.g. left by an older, interrupted save) is rebuilt.
+    """
+    from sentence_transformers import SentenceTransformer
+
+    local_path = Path(local_path)
+    if (local_path / "modules.json").exists():
+        return SentenceTransformer(str(local_path))
+
+    logging.getLogger(__name__).info(
+        f"Saving embedding model {hub_name} to {local_path} (one time)."
+    )
+    model = SentenceTransformer(hub_name)
+    partial = local_path.with_name(local_path.name + ".partial")
+    shutil.rmtree(partial, ignore_errors=True)
+    model.save(str(partial))
+    shutil.rmtree(local_path, ignore_errors=True)
+    os.replace(partial, local_path)
+    return model
+
+
+class RequestTracker:
+    """Tracks LLM calls per agent, per turn, and across the session.
+    Detects routing loops and outliers automatically.
+    Supports existing `request_counter[key] += 1` syntax unchanged.
+    """
+
+    OUTLIER_THRESHOLD = 4  # calls by one agent in a single turn before warning
+
+    def __init__(self):
+        self._totals: dict = {}  # cumulative across the whole session
+        self._turn_counts: dict = {}  # calls per agent in the current turn
+        self._turn_history: list = []  # summary of every completed turn
+        self._turn_label: str = ""  # human-readable label for the current turn
+
+    # ── dict-compatible interface ──────────────────────────────────────────────
+
+    def __getitem__(self, key: str) -> int:
+        return self._totals.get(key, 0)
+
+    def __setitem__(self, key: str, value: int):
+        old = self._totals.get(key, 0)
+        self._totals[key] = value
+        # detect an increment (e.g. counter[x] += 1) and mirror it to per-turn
+        if value == old + 1:
+            self._turn_counts[key] = self._turn_counts.get(key, 0) + 1
+            turn_count = self._turn_counts[key]
+            if turn_count == self.OUTLIER_THRESHOLD:
+                _tracker_logger = setup_logger("request_tracker")
+                _tracker_logger.warning(
+                    f"⚠️  LOOP DETECTED: '{key}' called {turn_count}x in this turn — "
+                    f"possible routing loop or repeated failure."
+                )
+
+    # ── turn lifecycle ─────────────────────────────────────────────────────────
+
+    def start_turn(self, label: str = ""):
+        """Call before each graph.ainvoke to reset per-turn counters."""
+        self._turn_counts = {}
+        self._turn_label = (
+            label[:80] if label else f"turn_{len(self._turn_history) + 1}"
+        )
+
+    def end_turn(self) -> dict:
+        """Call after each graph.ainvoke. Logs a summary and returns it."""
+        outliers = {
+            k: v for k, v in self._turn_counts.items() if v >= self.OUTLIER_THRESHOLD
+        }
+        summary = {
+            "turn": self._turn_label,
+            "calls": dict(self._turn_counts),
+            "total": sum(self._turn_counts.values()),
+            "outliers": outliers,
+        }
+        self._turn_history.append(summary)
+
+        _tracker_logger = setup_logger("request_tracker")
+        calls_str = " | ".join(
+            f"{k}: {v}" for k, v in sorted(self._turn_counts.items())
+        )
+        status = f" 🔴 OUTLIERS: {list(outliers.keys())}" if outliers else " ✅"
+        _tracker_logger.info(
+            f"📊 Turn summary [{summary['total']} calls]{status} — {calls_str or 'none'}"
+        )
+        return summary
+
+    # ── session helpers ────────────────────────────────────────────────────────
+
+    def session_total(self) -> int:
+        return sum(self._totals.values())
+
+    def session_summary(self) -> dict:
+        return {
+            "total_calls": self.session_total(),
+            "by_agent": dict(self._totals),
+            "turns": len(self._turn_history),
+            "turn_history": self._turn_history,
+        }
+
+
+request_counter = RequestTracker()
+
+
+def delete_thread_from_db(thread_id: str):
+    """Clear memory for a specific thread"""
+
+    # AsyncSqliteSaver stores checkpoints across two tables, "checkpoints"
+    # and "writes" (there is no "messages" table).
+    conn = sqlite3.connect(CHECKPOINT_DB)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM checkpoints WHERE thread_id = ?", (thread_id,))
+    deleted = cursor.rowcount
+    cursor.execute("DELETE FROM writes WHERE thread_id = ?", (thread_id,))
+    conn.commit()
+    conn.close()
+    print(f"✅ Deleted {deleted} checkpoints for thread: {thread_id}")
+
+
+def get_current_time():
+    now = datetime.now(pytz.timezone("Asia/Kolkata"))
+    return now.strftime("%Y-%m-%d %H:%M:%S IST")
+
+
+def sanitize_history(messages):
+    clean_history = []
+
+    for msg in messages:
+        # 1. Handle Human Messages (includes agent reports sent as HumanMessage)
+        if isinstance(msg, HumanMessage):
+            entry = {
+                "role": "user",
+                "name": getattr(msg, "name", None) or "human",
+                "content": msg.content[:500] + "..."
+                if isinstance(msg.content, str) and len(msg.content) > 500
+                else msg.content,
+            }
+            clean_history.append(entry)
+
+        # 2. Handle AI Messages
+        elif isinstance(msg, AIMessage):
+            # msg.name is where the actual agent name is stored
+            agent_name = getattr(msg, "name", None) or msg.additional_kwargs.get(
+                "agent_name", "unknown_agent"
+            )
+            routed_to = msg.additional_kwargs.get("routed_to")
+
+            entry = {
+                "role": "assistant",
+                "agent": agent_name,
+                "content": msg.content[:500] + "..."
+                if isinstance(msg.content, str) and len(msg.content) > 500
+                else (msg.content or ""),
+            }
+
+            if routed_to:
+                entry["routed_to"] = routed_to
+
+            if msg.tool_calls:
+                entry["tool_calls"] = [
+                    {"name": tool["name"], "args": tool["args"]}
+                    for tool in msg.tool_calls
+                ]
+
+            clean_history.append(entry)
+
+        # 3. Handle Tool Results
+        elif isinstance(msg, ToolMessage):
+            result = msg.content
+            if isinstance(result, str) and len(result) > 300:
+                result = result[:300] + "..."
+            clean_history.append(
+                {
+                    "role": "tool_result",
+                    "tool_name": getattr(msg, "name", None) or msg.tool_call_id,
+                    "tool_call_id": msg.tool_call_id,
+                    "result": result,
+                }
+            )
+
+    return clean_history
+
+
+def format_tool_to_text(tool_name, tool_args_str):
+    try:
+        args = json.loads(tool_args_str)
+    except (json.JSONDecodeError, TypeError):
+        return f"[Action: {tool_name}] (Args: {tool_args_str})"
+
+    if not isinstance(args, dict):
+        return f"[Action: {tool_name}] (Args: {tool_args_str})"
+
+    arg_summary = ", ".join([f"{k}={v}" for k, v in args.items()])
+    return f"__Tool Action__: Used {tool_name} with inputs: {arg_summary}"
+
+
+mock_tool_sets = {"communication": [], "planning": [], "content": [], "supervisor": []}
+
+
+async def get_agent_state(thread_id: str):
+    """Print the saved graph state of a thread (run: python -m utils.helper)."""
+    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+    async with aiosqlite.connect(str(CHECKPOINT_DB)) as conn:
+        checkpointer = AsyncSqliteSaver(conn)
+
+        from core.graph import build_graph
+
+        graph = build_graph(mock_tool_sets, checkpointer)
+
+        config = {"configurable": {"thread_id": thread_id}}
+
+        snapshot = await graph.aget_state(config)
+
+        if not snapshot.values:
+            print("❌ No state found for this thread ID.")
+            return
+
+        values = snapshot.values
+        print("=" * 40)
+        print(f"📊 STATE FOR THREAD: {thread_id}")
+        print("=" * 40)
+        print(
+            f"🕒 Last Memory Timestamp: {datetime.fromtimestamp(values.get('last_memory_timestamp')) if values.get('last_memory_timestamp') else 'N/A'}"
+        )
+        print(f"🧠 Summary: {values.get('summary')}")
+        print(f"📨 Total Messages: {len(values.get('messages', []))}")
+        print(f"🔜 Next Step: {snapshot.next}")
+        print("=" * 40)
+
+
+if __name__ == "__main__":
+    asyncio.run(get_agent_state(DEFAULT_THREAD_ID))
